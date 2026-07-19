@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import logging
+import re
 from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
@@ -34,12 +35,17 @@ from PySide6.QtWidgets import (
 )
 
 from winsshui.importers import ImportCandidate, WindowsClientImporter
-from winsshui.key_install import PublicKeyInstallCommand, create_public_key_install_command
+from winsshui.key_install import (
+    PublicKeyInstallCommand,
+    create_public_key_install_command,
+    create_public_key_removal_command,
+)
 from winsshui.diagnostics import SshDiagnostics
 from winsshui.catalog import ConnectionCatalog
 from winsshui.models import (
     CommandSnippet,
     ConnectionItem,
+    PaneDirection,
     TerminalLaunchMode,
     TunnelPreferences,
     WorkspaceItem,
@@ -47,7 +53,7 @@ from winsshui.models import (
 from winsshui.ssh_keys import SshKeyInfo, SshKeyManager
 from winsshui.ssh_writer import SshConnectionDraft
 from winsshui.logging_utils import export_diagnostics
-from winsshui.tunnels import tunnel_summary
+from winsshui.tunnels import configured_local_endpoints, tunnel_summary
 
 
 class ApplicationLogDialog(QDialog):
@@ -626,8 +632,10 @@ class SshKeyManagerDialog(QDialog):
         )
         description.setWordWrap(True)
         layout.addWidget(description)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Имя", "Тип", "Отпечаток", "Приватный", "В агенте"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["Имя", "Тип", "Отпечаток", "Возраст", "Состояние", "Приватный", "В агенте"]
+        )
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -666,7 +674,14 @@ class SshKeyManagerDialog(QDialog):
             name = QTableWidgetItem(key.name)
             name.setData(Qt.ItemDataRole.UserRole, key)
             self.table.setItem(row, 0, name)
-            values = (key.key_type, key.fingerprint, "Да" if key.private_path else "Нет", "Да" if key.loaded_in_agent else "Нет")
+            values = (
+                key.key_type,
+                key.fingerprint,
+                f"{key.age_days} дн." if key.age_days is not None else "—",
+                key.lifecycle_warning,
+                "Да" if key.private_path else "Нет",
+                "Да" if key.loaded_in_agent else "Нет",
+            )
             for column, value in enumerate(values, start=1):
                 self.table.setItem(row, column, QTableWidgetItem(value))
 
@@ -729,6 +744,7 @@ class InstallPublicKeyDialog(QDialog):
         alias: str,
         askpass_path: str | None = None,
         credential_alias: str | None = None,
+        remove: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -737,18 +753,22 @@ class InstallPublicKeyDialog(QDialog):
         self.alias = alias
         self.askpass_path = askpass_path
         self.credential_alias = credential_alias
+        self.remove = remove
         self._process: QProcess | None = None
         self._public_key = ""
         self._private_path: str | None = None
         self._stage = ""
-        self.setWindowTitle(f"Установка ключа — {alias}")
+        self.setWindowTitle(f"{'Удаление' if remove else 'Установка'} ключа — {alias}")
         self.resize(650, 390)
 
         layout = QVBoxLayout(self)
         description = QLabel(
-            "Публичный ключ будет добавлен в ~/.ssh/authorized_keys через защищённое "
-            "SSH-подключение. Приложение не передаёт ключ в аргументах процесса и не "
-            "изменяет проверку ключа сервера."
+            (
+                "Выбранный публичный ключ будет удалён из ~/.ssh/authorized_keys. "
+                if remove
+                else "Публичный ключ будет добавлен в ~/.ssh/authorized_keys. "
+            )
+            + "Ключ передаётся через stdin защищённого SSH-подключения, а проверка ключа сервера не изменяется."
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -762,7 +782,9 @@ class InstallPublicKeyDialog(QDialog):
         self.output.setPlaceholderText("Здесь появится результат установки и проверки.")
         layout.addWidget(self.output, 1)
         actions = QHBoxLayout()
-        self.install_button = QPushButton("Установить и проверить")
+        self.install_button = QPushButton(
+            "Удалить и проверить" if remove else "Установить и проверить"
+        )
         self.install_button.setObjectName("accentButton")
         self.install_button.clicked.connect(self._start)
         close_button = QPushButton("Закрыть")
@@ -796,13 +818,23 @@ class InstallPublicKeyDialog(QDialog):
         try:
             self._public_key = key.public_path.read_text(encoding="utf-8").strip()
             self._private_path = str(key.private_path) if key.private_path else None
-            command = create_public_key_install_command(
-                self.ssh_path, self.alias, self._public_key
+            command = (
+                create_public_key_removal_command(
+                    self.ssh_path, self.alias, self._public_key
+                )
+                if self.remove
+                else create_public_key_install_command(
+                    self.ssh_path, self.alias, self._public_key
+                )
             )
         except (OSError, ValueError) as exception:
             QMessageBox.warning(self, "Не удалось подготовить ключ", str(exception))
             return
-        self.output.setPlainText("Подключаюсь и устанавливаю публичный ключ…")
+        self.output.setPlainText(
+            "Подключаюсь и удаляю публичный ключ…"
+            if self.remove
+            else "Подключаюсь и устанавливаю публичный ключ…"
+        )
         self.install_button.setEnabled(False)
         self._run(command, "install")
 
@@ -843,14 +875,24 @@ class InstallPublicKeyDialog(QDialog):
             self.install_button.setEnabled(True)
             return
         if stage == "install":
-            self.output.appendPlainText("\nКлюч записан. Проверяю результат без пароля…")
+            if self.remove:
+                self.output.appendPlainText(
+                    "\nГотово: authorized_keys обновлён, строка выбранного ключа удалена."
+                )
+                self.install_button.setEnabled(True)
+                return
+            self.output.appendPlainText(
+                "\nКлюч записан. Проверяю результат без пароля…"
+            )
             try:
-                command = create_public_key_install_command(
-                    self.ssh_path,
-                    self.alias,
-                    self._public_key,
-                    verify=True,
-                    identity_file=self._private_path,
+                builder = (
+                    create_public_key_removal_command
+                    if self.remove
+                    else create_public_key_install_command
+                )
+                command = builder(
+                    self.ssh_path, self.alias, self._public_key,
+                    verify=True, identity_file=self._private_path,
                 )
             except ValueError as exception:
                 self.output.appendPlainText(f"\nОшибка проверки: {exception}")
@@ -858,7 +900,9 @@ class InstallPublicKeyDialog(QDialog):
                 return
             self._run(command, "verify")
             return
-        if self._private_path:
+        if self.remove:
+            message = "Готово: строка ключа отсутствует в authorized_keys."
+        elif self._private_path:
             message = "Готово: установленный ключ найден и проверен подключением без пароля."
         else:
             message = "Готово: строка ключа найдена в authorized_keys. Приватная часть недоступна для отдельной проверки."
@@ -889,6 +933,7 @@ class TunnelManagerDialog(QDialog):
         connections: list[ConnectionItem],
         is_active: Callable[[str], bool],
         toggle: Callable[[str], None],
+        runtime_details: Callable[[str], dict[str, object]],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -902,6 +947,7 @@ class TunnelManagerDialog(QDialog):
         ]
         self.is_active = is_active
         self.toggle = toggle
+        self.runtime_details = runtime_details
         self._loading = False
         self.setWindowTitle("Менеджер SSH-туннелей")
         self.resize(900, 510)
@@ -912,9 +958,12 @@ class TunnelManagerDialog(QDialog):
         )
         description.setWordWrap(True)
         layout.addWidget(description)
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["Подключение", "Пробросы", "Состояние", "Автоперезапуск", "При запуске"]
+            [
+                "Подключение", "Пробросы", "Локальные адреса", "Состояние",
+                "Время работы", "Рестарты", "Автоперезапуск", "При запуске",
+            ]
         )
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -932,13 +981,24 @@ class TunnelManagerDialog(QDialog):
         self.toggle_button.clicked.connect(self._toggle_selected)
         refresh_button = QPushButton("Обновить")
         refresh_button.clicked.connect(self.refresh)
+        copy_endpoint = QPushButton("Копировать адрес")
+        copy_endpoint.clicked.connect(self._copy_endpoint)
+        open_browser = QPushButton("Открыть в браузере")
+        open_browser.clicked.connect(self._open_browser)
         close_button = QPushButton("Закрыть")
         close_button.clicked.connect(self.accept)
         actions.addWidget(refresh_button)
+        actions.addWidget(copy_endpoint)
+        actions.addWidget(open_browser)
         actions.addStretch()
         actions.addWidget(self.toggle_button)
         actions.addWidget(close_button)
         layout.addLayout(actions)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(110)
+        self.log.setPlaceholderText("Журнал выбранного туннеля")
+        layout.addWidget(self.log)
         self._populate()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.refresh)
@@ -955,10 +1015,16 @@ class TunnelManagerDialog(QDialog):
             summary = QTableWidgetItem(tunnel_summary(connection.host))
             summary.setToolTip(summary.text())
             self.table.setItem(row, 1, summary)
-            self.table.setItem(row, 2, QTableWidgetItem())
+            endpoints = ", ".join(
+                endpoint.display for endpoint in configured_local_endpoints(connection.host)
+            )
+            self.table.setItem(row, 2, QTableWidgetItem(endpoints or "—"))
+            self.table.setItem(row, 3, QTableWidgetItem())
+            self.table.setItem(row, 4, QTableWidgetItem("—"))
+            self.table.setItem(row, 5, QTableWidgetItem("0"))
             saved = preferences.get(connection.alias.casefold(), TunnelPreferences(connection.alias))
-            self.table.setItem(row, 3, self._check_item(saved.auto_restart))
-            self.table.setItem(row, 4, self._check_item(saved.start_with_app))
+            self.table.setItem(row, 6, self._check_item(saved.auto_restart))
+            self.table.setItem(row, 7, self._check_item(saved.start_with_app))
         self._loading = False
         if self.connections:
             self.table.selectRow(0)
@@ -979,7 +1045,7 @@ class TunnelManagerDialog(QDialog):
         return value if isinstance(value, str) else None
 
     def _preference_changed(self, item: QTableWidgetItem) -> None:
-        if self._loading or item.column() not in (3, 4):
+        if self._loading or item.column() not in (6, 7):
             return
         row = item.row()
         alias_item = self.table.item(row, 0)
@@ -988,8 +1054,8 @@ class TunnelManagerDialog(QDialog):
         self.catalog.save_tunnel_preferences(
             TunnelPreferences(
                 str(alias_item.data(Qt.ItemDataRole.UserRole)),
-                self.table.item(row, 3).checkState() == Qt.CheckState.Checked,
-                self.table.item(row, 4).checkState() == Qt.CheckState.Checked,
+                self.table.item(row, 6).checkState() == Qt.CheckState.Checked,
+                self.table.item(row, 7).checkState() == Qt.CheckState.Checked,
             )
         )
 
@@ -1005,16 +1071,37 @@ class TunnelManagerDialog(QDialog):
         self.toggle_button.setText(
             "Остановить" if alias and self.is_active(alias) else "Запустить"
         )
+        details = self.runtime_details(alias) if alias else {}
+        self.log.setPlainText(str(details.get("log", "")))
 
     def refresh(self) -> None:
         for row in range(self.table.rowCount()):
             alias_item = self.table.item(row, 0)
             alias = str(alias_item.data(Qt.ItemDataRole.UserRole))
             active = self.is_active(alias)
-            status = self.table.item(row, 2)
+            status = self.table.item(row, 3)
             status.setText("Работает" if active else "Остановлен")
             status.setForeground(Qt.GlobalColor.darkGreen if active else Qt.GlobalColor.gray)
+            details = self.runtime_details(alias)
+            self.table.item(row, 4).setText(str(details.get("uptime", "—")))
+            self.table.item(row, 5).setText(str(details.get("restarts", 0)))
         self._selection_changed()
+
+    def _selected_endpoint(self) -> str | None:
+        row = self.table.currentRow()
+        value = self.table.item(row, 2).text().split(",", 1)[0].strip() if row >= 0 else ""
+        return value if value and value != "—" else None
+
+    def _copy_endpoint(self) -> None:
+        endpoint = self._selected_endpoint()
+        if endpoint:
+            QApplication.clipboard().setText(endpoint)
+
+    def _open_browser(self) -> None:
+        endpoint = self._selected_endpoint()
+        if endpoint:
+            normalized = endpoint.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]")
+            QDesktopServices.openUrl(QUrl(f"http://{normalized}"))
 
 
 class WorkspaceDialog(QDialog):
@@ -1028,6 +1115,7 @@ class WorkspaceDialog(QDialog):
         self.catalog = catalog
         self.connections = connections
         self.launch_items: tuple[WorkspaceItem, ...] = ()
+        self.launch_window_name = "winsshui"
         self.workspaces = self.catalog.get_workspaces()
         self.setWindowTitle("Рабочие пространства")
         self.resize(720, 580)
@@ -1048,10 +1136,19 @@ class WorkspaceDialog(QDialog):
 
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Например, Production")
-        layout.addWidget(self.name_edit)
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Название:"))
+        name_row.addWidget(self.name_edit, 1)
+        self.window_name_edit = QLineEdit("winsshui")
+        self.window_name_edit.setPlaceholderText("Имя окна Windows Terminal")
+        name_row.addWidget(QLabel("Окно Terminal:"))
+        name_row.addWidget(self.window_name_edit, 1)
+        layout.addLayout(name_row)
 
-        self.table = QTableWidget(len(connections), 3)
-        self.table.setHorizontalHeaderLabels(["Открыть", "Подключение", "Расположение"])
+        self.table = QTableWidget(len(connections), 7)
+        self.table.setHorizontalHeaderLabels(
+            ["Открыть", "Подключение", "Расположение", "Направление", "Размер, %", "Заголовок", "Цвет"]
+        )
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         for row, connection in enumerate(connections):
@@ -1064,9 +1161,23 @@ class WorkspaceDialog(QDialog):
             mode_combo = QComboBox()
             mode_combo.addItem("Новая вкладка", TerminalLaunchMode.NEW_TAB)
             mode_combo.addItem("Панель справа", TerminalLaunchMode.SPLIT_RIGHT)
+            direction_combo = QComboBox()
+            direction_combo.addItem("Справа", PaneDirection.VERTICAL)
+            direction_combo.addItem("Снизу", PaneDirection.HORIZONTAL)
+            size_spin = QSpinBox()
+            size_spin.setRange(10, 90)
+            size_spin.setValue(50)
+            title_edit = QLineEdit()
+            title_edit.setPlaceholderText(connection.alias)
+            color_edit = QLineEdit()
+            color_edit.setPlaceholderText("#2F6FD1")
             self.table.setItem(row, 0, selected)
             self.table.setItem(row, 1, alias_item)
             self.table.setCellWidget(row, 2, mode_combo)
+            self.table.setCellWidget(row, 3, direction_combo)
+            self.table.setCellWidget(row, 4, size_spin)
+            self.table.setCellWidget(row, 5, title_edit)
+            self.table.setCellWidget(row, 6, color_edit)
         layout.addWidget(self.table, 1)
 
         actions = QHBoxLayout()
@@ -1098,14 +1209,37 @@ class WorkspaceDialog(QDialog):
                 if isinstance(mode_combo, QComboBox)
                 else TerminalLaunchMode.NEW_TAB
             )
-            result.append(WorkspaceItem(selected.data(Qt.ItemDataRole.UserRole), mode))
+            direction_combo = self.table.cellWidget(row, 3)
+            size_spin = self.table.cellWidget(row, 4)
+            title_edit = self.table.cellWidget(row, 5)
+            color_edit = self.table.cellWidget(row, 6)
+            direction = (
+                direction_combo.currentData()
+                if isinstance(direction_combo, QComboBox)
+                else PaneDirection.VERTICAL
+            )
+            color = color_edit.text().strip() if isinstance(color_edit, QLineEdit) else ""
+            if color and not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+                raise ValueError(f"Некорректный цвет для {selected.data(Qt.ItemDataRole.UserRole)}")
+            result.append(
+                WorkspaceItem(
+                    str(selected.data(Qt.ItemDataRole.UserRole)),
+                    mode,
+                    direction,
+                    (size_spin.value() / 100) if isinstance(size_spin, QSpinBox) else 0.5,
+                    title_edit.text().strip() or None if isinstance(title_edit, QLineEdit) else None,
+                    color or None,
+                )
+            )
         if result:
-            result[0] = WorkspaceItem(result[0].alias, TerminalLaunchMode.NEW_TAB)
+            result[0] = replace(result[0], mode=TerminalLaunchMode.NEW_TAB)
         return tuple(result)
 
     def _save(self) -> None:
         try:
-            workspace = self.catalog.save_workspace(self.name_edit.text(), self._collect())
+            workspace = self.catalog.save_workspace(
+                self.name_edit.text(), self._collect(), self.window_name_edit.text()
+            )
         except (ValueError, sqlite3.Error) as exception:
             QMessageBox.warning(self, "Не удалось сохранить пространство", str(exception))
             return
@@ -1123,11 +1257,14 @@ class WorkspaceDialog(QDialog):
             return
         if self.name_edit.text().strip():
             try:
-                self.catalog.save_workspace(self.name_edit.text(), items)
+                self.catalog.save_workspace(
+                    self.name_edit.text(), items, self.window_name_edit.text()
+                )
             except (ValueError, sqlite3.Error) as exception:
                 QMessageBox.warning(self, "Не удалось сохранить пространство", str(exception))
                 return
         self.launch_items = items
+        self.launch_window_name = self.window_name_edit.text().strip() or "winsshui"
         self.accept()
 
     def _delete(self) -> None:
@@ -1150,6 +1287,7 @@ class WorkspaceDialog(QDialog):
     def _new_workspace(self) -> None:
         self.workspace_combo.setCurrentIndex(0)
         self.name_edit.clear()
+        self.window_name_edit.setText("winsshui")
         for row in range(self.table.rowCount()):
             self.table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)
             mode_combo = self.table.cellWidget(row, 2)
@@ -1166,6 +1304,7 @@ class WorkspaceDialog(QDialog):
             self.name_edit.clear()
             return
         self.name_edit.setText(workspace.name)
+        self.window_name_edit.setText(workspace.window_name)
         items = {item.alias.casefold(): item for item in workspace.items}
         for row in range(self.table.rowCount()):
             selected = self.table.item(row, 0)
@@ -1175,6 +1314,20 @@ class WorkspaceDialog(QDialog):
             if isinstance(mode_combo, QComboBox):
                 index = mode_combo.findData(item.mode if item else TerminalLaunchMode.NEW_TAB)
                 mode_combo.setCurrentIndex(max(index, 0))
+            direction_combo = self.table.cellWidget(row, 3)
+            if isinstance(direction_combo, QComboBox):
+                direction_combo.setCurrentIndex(
+                    max(direction_combo.findData(item.split_direction if item else PaneDirection.VERTICAL), 0)
+                )
+            size_spin = self.table.cellWidget(row, 4)
+            if isinstance(size_spin, QSpinBox):
+                size_spin.setValue(round((item.split_size if item else 0.5) * 100))
+            title_edit = self.table.cellWidget(row, 5)
+            if isinstance(title_edit, QLineEdit):
+                title_edit.setText(item.title if item and item.title else "")
+            color_edit = self.table.cellWidget(row, 6)
+            if isinstance(color_edit, QLineEdit):
+                color_edit.setText(item.tab_color if item and item.tab_color else "")
 
 
 class ImportConnectionsDialog(QDialog):

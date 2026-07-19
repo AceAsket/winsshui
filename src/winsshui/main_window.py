@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QIODevice, QPoint, QProcess, QSaveFile, QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QKeySequence, QShortcut
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -64,6 +64,7 @@ from winsshui.device_icons import (
     resolve_device_icon,
 )
 from winsshui.host_keys import KnownHostsManager
+from winsshui.health_dialog import ConnectionHealthDialog
 from winsshui.importers import ImportCandidate, WindowsClientImporter, connection_fingerprint
 from winsshui.models import (
     CommandSnippet,
@@ -83,6 +84,9 @@ from winsshui.terminal import (
     WinScpLauncher,
     detect_tools,
 )
+from winsshui.productivity_dialogs import BulkActionsDialog, QuickLaunchDialog
+from winsshui.transfer_dialog import SftpBrowserDialog
+from winsshui.transfers import OpenSshTransferManager
 from winsshui.tunnels import configured_local_endpoints, find_port_conflicts
 from winsshui.updates import (
     LATEST_RELEASE_API,
@@ -116,6 +120,7 @@ class MainWindow(QMainWindow):
         self.client_importer = WindowsClientImporter()
         self.terminal_launcher = WindowsTerminalLauncher()
         self.winscp_launcher = WinScpLauncher()
+        self.transfer_manager = OpenSshTransferManager()
         self.host_key_manager = KnownHostsManager(Path.home() / ".ssh" / "known_hosts")
         self.tools = detect_tools()
         self.key_manager = SshKeyManager(
@@ -130,6 +135,9 @@ class MainWindow(QMainWindow):
         self._tunnel_processes: dict[str, QProcess] = {}
         self._stopping_tunnels: set[str] = set()
         self._tunnel_restart_attempts: dict[str, int] = {}
+        self._tunnel_started_at: dict[str, datetime] = {}
+        self._tunnel_restart_counts: dict[str, int] = {}
+        self._tunnel_logs: dict[str, list[str]] = {}
         self._closing = False
         self._force_quit = False
         self._tray_hint_shown = False
@@ -149,6 +157,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        self.quick_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self.quick_shortcut.activated.connect(self._show_quick_launch)
 
         try:
             self.catalog.initialize()
@@ -178,6 +188,9 @@ class MainWindow(QMainWindow):
         title_block.addWidget(subtitle)
         header.addLayout(title_block)
         header.addStretch()
+        self.quick_button = QPushButton("Быстро · Ctrl+K")
+        self.quick_button.clicked.connect(self._show_quick_launch)
+        header.addWidget(self.quick_button)
         self.new_button = QPushButton("＋  Подключение")
         self.new_button.setObjectName("accentButton")
         self.new_button.clicked.connect(self._create_connection)
@@ -407,7 +420,11 @@ class MainWindow(QMainWindow):
         self.notes_edit = QPlainTextEdit()
         self.notes_edit.setPlaceholderText("Назначение, контакты, особенности подключения…")
         self.notes_edit.setMaximumHeight(72)
-        self.save_group_button = QPushButton("Сохранить")
+        remote_path_label = QLabel("Удалённая папка")
+        remote_path_label.setObjectName("fieldName")
+        self.remote_path_edit = QLineEdit()
+        self.remote_path_edit.setPlaceholderText("Например, /var/www/")
+        self.save_group_button = QPushButton("Сохранить организацию")
         self.save_group_button.clicked.connect(self._save_group)
         organization_grid.addWidget(group_label, 0, 0)
         organization_grid.addWidget(self.group_edit, 0, 1)
@@ -417,7 +434,14 @@ class MainWindow(QMainWindow):
         organization_grid.addWidget(self.tags_edit, 2, 1)
         organization_grid.addWidget(notes_label, 3, 0)
         organization_grid.addWidget(self.notes_edit, 3, 1)
-        organization_grid.addWidget(self.save_group_button, 0, 2, 4, 1)
+        organization_grid.addWidget(remote_path_label, 4, 0)
+        organization_grid.addWidget(self.remote_path_edit, 4, 1)
+        organization_grid.addWidget(
+            self.save_group_button,
+            5,
+            1,
+            Qt.AlignmentFlag.AlignRight,
+        )
         organization_grid.setColumnStretch(1, 1)
         layout.addLayout(organization_grid)
 
@@ -479,6 +503,11 @@ class MainWindow(QMainWindow):
         secondary_actions.addWidget(self.tunnel_button, 1)
         secondary_actions.addWidget(self.winscp_button, 1)
         launch_layout.addLayout(secondary_actions)
+        self.sftp_button = QPushButton("Файлы SFTP / SCP")
+        self.sftp_button.clicked.connect(self._open_sftp)
+        if not self.transfer_manager.available:
+            self.sftp_button.setToolTip("sftp.exe или scp.exe не найден")
+        launch_layout.addWidget(self.sftp_button)
         layout.addWidget(launch_panel)
 
         self._set_details_enabled(False)
@@ -755,6 +784,7 @@ class MainWindow(QMainWindow):
                         icon_name=saved.icon_name if saved else None,
                         notes=saved.notes if saved else None,
                         tags=saved.tags if saved else (),
+                        remote_path=saved.remote_path if saved else None,
                     )
                 )
             self._rebuild_connection_list(selected_alias)
@@ -946,6 +976,7 @@ class MainWindow(QMainWindow):
                         current.icon_name,
                         current.notes,
                         current.tags,
+                        current.remote_path,
                     )
                 )
 
@@ -973,6 +1004,7 @@ class MainWindow(QMainWindow):
                         current.icon_name,
                         current.notes,
                         current.tags,
+                        current.remote_path,
                     )
                 )
             for candidate, item in unchanged:
@@ -987,6 +1019,7 @@ class MainWindow(QMainWindow):
                         item.icon_name,
                         item.notes,
                         item.tags,
+                        item.remote_path,
                     )
                 )
             self.reload_connections()
@@ -1034,6 +1067,7 @@ class MainWindow(QMainWindow):
                     connection.icon_name,
                     connection.notes,
                     connection.tags,
+                    connection.remote_path,
                 ),
             )
             if self.credential_store and draft.alias.casefold() != connection.alias.casefold():
@@ -1089,6 +1123,7 @@ class MainWindow(QMainWindow):
                     icon_name=connection.icon_name,
                     notes=connection.notes,
                     tags=connection.tags,
+                    remote_path=connection.remote_path,
                 )
             )
             self.reload_connections()
@@ -1143,6 +1178,7 @@ class MainWindow(QMainWindow):
             or search in connection.group_display.casefold()
             or search in (connection.notes or "").casefold()
             or any(search in tag.casefold() for tag in connection.tags)
+            or search in (connection.remote_path or "").casefold()
         ]
         filtered.sort(
             key=lambda connection: (
@@ -1280,6 +1316,7 @@ class MainWindow(QMainWindow):
             self.icon_combo.setCurrentIndex(0)
             self.tags_edit.clear()
             self.notes_edit.clear()
+            self.remote_path_edit.clear()
             self.device_icon_label.clear()
             self.favorite_button.setChecked(False)
             self.favorite_button.setText("☆")
@@ -1303,6 +1340,7 @@ class MainWindow(QMainWindow):
         self.group_edit.setText(connection.group_name or "")
         self.tags_edit.setText(", ".join(connection.tags))
         self.notes_edit.setPlainText(connection.notes or "")
+        self.remote_path_edit.setText(connection.remote_path or "")
         icon_index = self.icon_combo.findData(connection.icon_name)
         self.icon_combo.setCurrentIndex(max(0, icon_index))
         icon_name = resolve_device_icon(
@@ -1330,6 +1368,7 @@ class MainWindow(QMainWindow):
         self.icon_combo.setEnabled(has_selection)
         self.tags_edit.setEnabled(has_selection)
         self.notes_edit.setEnabled(has_selection)
+        self.remote_path_edit.setEnabled(has_selection)
         self.save_group_button.setEnabled(has_selection)
         self.host_key_button.setEnabled(has_selection and self.host_key_manager.available)
         self.diagnostics_button.setEnabled(has_selection and self.tools.ssh_path is not None)
@@ -1340,6 +1379,7 @@ class MainWindow(QMainWindow):
         self.snippets_button.setEnabled(has_selection)
         self.delete_button.setEnabled(has_selection)
         self.winscp_button.setEnabled(has_selection and self.winscp_launcher.available)
+        self.sftp_button.setEnabled(has_selection and self.transfer_manager.available)
         if not has_selection:
             self.tunnel_button.setEnabled(False)
 
@@ -1554,10 +1594,89 @@ class MainWindow(QMainWindow):
         install_action = menu.addAction("Установить публичный ключ…")
         install_action.setEnabled(self._selected_connection() is not None and self.tools.ssh_path is not None)
         install_action.triggered.connect(self._install_public_key)
+        remove_key_action = menu.addAction("Удалить публичный ключ с сервера…")
+        remove_key_action.setEnabled(
+            self._selected_connection() is not None and self.tools.ssh_path is not None
+        )
+        remove_key_action.triggered.connect(self._remove_public_key)
         menu.addSeparator()
         tunnels_action = menu.addAction("Менеджер туннелей…")
         tunnels_action.triggered.connect(self._show_tunnel_manager)
+        bulk_action = menu.addAction("Массовые действия…")
+        bulk_action.triggered.connect(lambda: self._show_bulk_actions())
+        health_action = menu.addAction("Состояние подключений…")
+        health_action.triggered.connect(lambda: self._show_health())
         menu.exec(self.ssh_tools_button.mapToGlobal(QPoint(0, self.ssh_tools_button.height())))
+
+    def _show_quick_launch(self) -> None:
+        QuickLaunchDialog(
+            self.connections,
+            self._launch_connection,
+            lambda connection: self._open_sftp(connection),
+            lambda connection: self._open_connection_in_winscp(
+                connection, connection.remote_path
+            ),
+            lambda connection: self._toggle_tunnels(connection),
+            self,
+        ).exec()
+
+    def _show_bulk_actions(self, selected_aliases: set[str] | None = None) -> None:
+        BulkActionsDialog(
+            self.connections,
+            selected_aliases,
+            self._apply_bulk_metadata,
+            self._show_health,
+            self._start_bulk_tunnels,
+            self._open_bulk_workspace,
+            self,
+        ).exec()
+
+    def _show_health(self, connections: list[ConnectionItem] | None = None) -> None:
+        try:
+            ConnectionHealthDialog(
+                self.catalog,
+                self.ssh_diagnostics,
+                connections or self.connections,
+                self,
+            ).exec()
+        except sqlite3.Error as exception:
+            self._show_error("Не удалось открыть монитор подключений", exception)
+
+    def _apply_bulk_metadata(
+        self,
+        connections: list[ConnectionItem],
+        group_name: str | None,
+        tags: tuple[str, ...],
+        icon_name: str | None,
+    ) -> None:
+        try:
+            for connection in connections:
+                if group_name is not None:
+                    connection.group_name = group_name or None
+                if tags:
+                    connection.tags = self._parse_tags(",".join((*connection.tags, *tags)))
+                if icon_name is not None:
+                    connection.icon_name = icon_name
+                self.catalog.save_metadata(connection.metadata())
+            self._rebuild_connection_list()
+            self.status_label.setText(f"Обновлено подключений: {len(connections)}")
+        except sqlite3.Error as exception:
+            self._show_error("Не удалось выполнить массовое изменение", exception)
+
+    def _start_bulk_tunnels(self, connections: list[ConnectionItem]) -> None:
+        for index, connection in enumerate(connections):
+            if self._has_tunnels(connection) and not self._is_tunnel_active(connection.alias):
+                QTimer.singleShot(index * 250, lambda item=connection: self._toggle_tunnels(item))
+
+    def _open_bulk_workspace(self, connections: list[ConnectionItem]) -> None:
+        items = [(connection.host, TerminalLaunchMode.NEW_TAB) for connection in connections]
+        try:
+            self.terminal_launcher.launch_workspace(items)
+            for connection in connections:
+                self.catalog.record_launch(connection.alias, TerminalLaunchMode.NEW_TAB)
+            self._reload_history()
+        except (OSError, ValueError, sqlite3.Error) as exception:
+            self._show_error("Не удалось открыть подключения", exception)
 
     def _show_tunnel_manager(self) -> None:
         try:
@@ -1566,6 +1685,7 @@ class MainWindow(QMainWindow):
                 self.connections,
                 self._is_tunnel_active,
                 lambda alias: self._toggle_tunnels(self._connection_by_alias(alias)),
+                self._tunnel_runtime_details,
                 self,
             ).exec()
         except sqlite3.Error as exception:
@@ -1581,7 +1701,30 @@ class MainWindow(QMainWindow):
             connection.alias,
             self.terminal_launcher.askpass_path,
             self._credential_alias_for(connection),
+            parent=self,
+        ).exec()
+
+    def _remove_public_key(self) -> None:
+        connection = self._selected_connection()
+        if not connection or not self.tools.ssh_path:
+            return
+        if QMessageBox.warning(
             self,
+            "Удаление публичного ключа",
+            f"Удалить выбранный ключ из authorized_keys на {connection.alias}?\n\n"
+            "Сначала убедитесь, что остаётся другой способ входа.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        InstallPublicKeyDialog(
+            self.key_manager,
+            self.tools.ssh_path,
+            connection.alias,
+            self.terminal_launcher.askpass_path,
+            self._credential_alias_for(connection),
+            remove=True,
+            parent=self,
         ).exec()
 
     def _setup_tray(self) -> None:
@@ -1602,6 +1745,8 @@ class MainWindow(QMainWindow):
         menu.clear()
         show_action = menu.addAction("Открыть WinSSH UI")
         show_action.triggered.connect(self._show_from_tray)
+        quick_action = menu.addAction("Быстрое подключение…")
+        quick_action.triggered.connect(self._show_quick_launch)
         favorites_menu = menu.addMenu("Избранное")
         favorites = sorted(
             (connection for connection in self.connections if connection.is_favorite),
@@ -1689,6 +1834,14 @@ class MainWindow(QMainWindow):
         close_to_tray.setChecked(self.catalog.get_setting("ui.close_to_tray") == "1")
         close_to_tray.setEnabled(self.tray_icon is not None)
         close_to_tray.toggled.connect(self._set_close_to_tray)
+        winscp_new_instance = menu.addAction("WinSCP: всегда открывать новое окно")
+        winscp_new_instance.setCheckable(True)
+        winscp_new_instance.setChecked(self.catalog.get_setting("winscp.new_instance") == "1")
+        winscp_new_instance.toggled.connect(
+            lambda enabled: self.catalog.save_setting(
+                "winscp.new_instance", "1" if enabled else "0"
+            )
+        )
         menu.addSeparator()
         export_action = menu.addAction("Экспортировать резервную копию…")
         export_action.triggered.connect(self._export_backup)
@@ -2074,6 +2227,12 @@ class MainWindow(QMainWindow):
         item = self.connection_list.itemAt(position)
         connection = item.data(0, Qt.ItemDataRole.UserRole) if item else None
         if not isinstance(connection, ConnectionItem):
+            aliases = self._tree_connection_aliases(item) if item else set()
+            if aliases:
+                menu = QMenu(self)
+                bulk_action = menu.addAction(f"Массовые действия ({len(aliases)})…")
+                bulk_action.triggered.connect(lambda: self._show_bulk_actions(aliases))
+                menu.exec(self.connection_list.viewport().mapToGlobal(position))
             return
         self.connection_list.setCurrentItem(item)
         menu = QMenu(self)
@@ -2104,6 +2263,9 @@ class MainWindow(QMainWindow):
         winscp_action = menu.addAction("Открыть в WinSCP")
         winscp_action.setEnabled(self.winscp_launcher.available)
         winscp_action.triggered.connect(self._open_in_winscp)
+        sftp_action = menu.addAction("Файлы SFTP / SCP")
+        sftp_action.setEnabled(self.transfer_manager.available)
+        sftp_action.triggered.connect(self._open_sftp)
         diagnostics_action = menu.addAction("Проверить подключение")
         diagnostics_action.setEnabled(self.tools.ssh_path is not None)
         diagnostics_action.triggered.connect(self._show_diagnostics)
@@ -2135,6 +2297,18 @@ class MainWindow(QMainWindow):
         delete_action.triggered.connect(self._delete_connection)
         menu.exec(self.connection_list.viewport().mapToGlobal(position))
 
+    @staticmethod
+    def _tree_connection_aliases(item: QTreeWidgetItem) -> set[str]:
+        aliases: set[str] = set()
+        pending = [item]
+        while pending:
+            current = pending.pop()
+            value = current.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(value, ConnectionItem):
+                aliases.add(value.alias)
+            pending.extend(current.child(index) for index in range(current.childCount()))
+        return aliases
+
     def _show_workspaces(self) -> None:
         try:
             dialog = WorkspaceDialog(self.catalog, self.connections, self)
@@ -2145,7 +2319,7 @@ class MainWindow(QMainWindow):
             return
         by_alias = {connection.alias.casefold(): connection for connection in self.connections}
         items = [
-            (by_alias[item.alias.casefold()].host, item.mode)
+            (by_alias[item.alias.casefold()].host, item)
             for item in dialog.launch_items
             if item.alias.casefold() in by_alias
         ]
@@ -2157,9 +2331,9 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            self.terminal_launcher.launch_workspace(items)
-            for host, mode in items:
-                self.catalog.record_launch(host.alias, mode)
+            self.terminal_launcher.launch_workspace(items, dialog.launch_window_name)
+            for host, item in items:
+                self.catalog.record_launch(host.alias, item.mode)
             self._reload_history()
             self.status_label.setText(f"Открываю рабочее пространство: подключений {len(items)}")
         except (OSError, ValueError, sqlite3.Error) as exception:
@@ -2169,6 +2343,11 @@ class MainWindow(QMainWindow):
         connection = self._selected_connection()
         if not connection:
             return
+        self._open_connection_in_winscp(connection, connection.remote_path)
+
+    def _open_connection_in_winscp(
+        self, connection: ConnectionItem, remote_path: str | None = None
+    ) -> None:
         effective = self._effective_configuration
         host = connection.host
         if effective and effective.alias == connection.alias:
@@ -2190,10 +2369,42 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         try:
-            self.winscp_launcher.launch(host)
+            self.winscp_launcher.launch(
+                host,
+                remote_path,
+                self.catalog.get_setting("winscp.new_instance") == "1",
+            )
             self.status_label.setText(f"Открываю {connection.alias} в WinSCP…")
         except (OSError, ValueError) as exception:
             self._show_error("Не удалось запустить WinSCP", exception)
+
+    def _open_sftp(self, connection: ConnectionItem | None = None) -> None:
+        connection = connection or self._selected_connection()
+        if not connection or not self.transfer_manager.available:
+            return
+        dialog = SftpBrowserDialog(
+            self.transfer_manager,
+            connection.alias,
+            connection.remote_path,
+            self.terminal_launcher.askpass_path,
+            self._credential_alias_for(connection),
+            lambda path: self._save_connection_remote_path(connection, path),
+            (
+                lambda path: self._open_connection_in_winscp(connection, path)
+            )
+            if self.winscp_launcher.available
+            else None,
+            self,
+        )
+        dialog.exec()
+        self.remote_path_edit.setText(connection.remote_path or "")
+
+    def _save_connection_remote_path(self, connection: ConnectionItem, path: str) -> None:
+        connection.remote_path = path
+        try:
+            self.catalog.save_metadata(connection.metadata())
+        except sqlite3.Error:
+            self.logger.exception("Could not save remote path for %s", connection.alias)
 
     def _toggle_tunnels(
         self,
@@ -2239,6 +2450,7 @@ class MainWindow(QMainWindow):
 
         if not automatic:
             self._tunnel_restart_attempts.pop(key, None)
+            self._tunnel_restart_counts.pop(key, None)
 
         process = QProcess(self)
         process.setProgram(self.tools.ssh_path)
@@ -2252,10 +2464,13 @@ class MainWindow(QMainWindow):
             )
         )
         process.start()
+        self._append_tunnel_log(connection.alias, "Запуск SSH-туннеля")
         self.status_label.setText(f"Запускаю туннели {connection.alias}…")
 
     def _tunnel_started(self, alias: str, process: QProcess) -> None:
         if self._tunnel_processes.get(alias.casefold()) is process:
+            self._tunnel_started_at[alias.casefold()] = datetime.now(UTC)
+            self._append_tunnel_log(alias, "Туннель запущен")
             self.status_label.setText(f"Туннели {alias} запущены")
             self._update_tunnel_button(self._selected_connection())
             QTimer.singleShot(30_000, lambda: self._mark_tunnel_stable(alias, process))
@@ -2271,7 +2486,12 @@ class MainWindow(QMainWindow):
         self._stopping_tunnels.discard(key)
         if self._tunnel_processes.get(key) is process:
             self._tunnel_processes.pop(key, None)
+        self._tunnel_started_at.pop(key, None)
         output = bytes(process.readAll()).decode("utf-8", errors="replace").strip()
+        self._append_tunnel_log(
+            alias,
+            output or ("Остановлен пользователем" if intentionally_stopped else f"ssh exit code {exit_code}"),
+        )
         process.deleteLater()
         selected = self._selected_connection()
         self._update_tunnel_button(selected)
@@ -2298,6 +2518,7 @@ class MainWindow(QMainWindow):
             return False
         attempt = self._tunnel_restart_attempts.get(key, 0) + 1
         self._tunnel_restart_attempts[key] = attempt
+        self._tunnel_restart_counts[key] = self._tunnel_restart_counts.get(key, 0) + 1
         delay_ms = min(60_000, 5_000 * (2 ** min(attempt - 1, 4)))
         self.status_label.setText(
             f"Туннели {alias} остановлены; перезапуск через {delay_ms // 1000} с"
@@ -2311,6 +2532,27 @@ class MainWindow(QMainWindow):
         )
         QTimer.singleShot(delay_ms, lambda: self._restart_tunnel(alias))
         return True
+
+    def _append_tunnel_log(self, alias: str, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        entries = self._tunnel_logs.setdefault(alias.casefold(), [])
+        entries.append(f"[{timestamp}] {message}")
+        del entries[:-100]
+
+    def _tunnel_runtime_details(self, alias: str) -> dict[str, object]:
+        key = alias.casefold()
+        started = self._tunnel_started_at.get(key)
+        uptime = "—"
+        if started:
+            seconds = max(0, int((datetime.now(UTC) - started).total_seconds()))
+            hours, remainder = divmod(seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            uptime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return {
+            "uptime": uptime,
+            "restarts": self._tunnel_restart_counts.get(key, 0),
+            "log": "\n".join(self._tunnel_logs.get(key, [])),
+        }
 
     def _restart_tunnel(self, alias: str) -> None:
         if self._closing or self._is_tunnel_active(alias):
@@ -2390,11 +2632,13 @@ class MainWindow(QMainWindow):
         previous_icon = connection.icon_name
         previous_notes = connection.notes
         previous_tags = connection.tags
+        previous_remote_path = connection.remote_path
         connection.group_name = self.group_edit.text().strip() or None
         selected_icon = self.icon_combo.currentData()
         connection.icon_name = selected_icon if isinstance(selected_icon, str) else None
         connection.notes = self.notes_edit.toPlainText().strip() or None
         connection.tags = self._parse_tags(self.tags_edit.text())
+        connection.remote_path = self.remote_path_edit.text().strip() or None
         try:
             self.catalog.save_metadata(connection.metadata())
             self.status_label.setText(f"Организация для {connection.alias} сохранена")
@@ -2404,6 +2648,7 @@ class MainWindow(QMainWindow):
             connection.icon_name = previous_icon
             connection.notes = previous_notes
             connection.tags = previous_tags
+            connection.remote_path = previous_remote_path
             self._show_error("Не удалось сохранить организацию", exception)
 
     @staticmethod
@@ -2491,6 +2736,7 @@ class MainWindow(QMainWindow):
         icon_name: str | None = None,
         notes: str | None = None,
         tags: tuple[str, ...] = (),
+        remote_path: str | None = None,
     ) -> ConnectionMetadata:
         return ConnectionMetadata(
             alias,
@@ -2504,6 +2750,7 @@ class MainWindow(QMainWindow):
             icon_name,
             notes,
             tags,
+            remote_path,
         )
 
     def _show_error(self, title: str, exception: Exception) -> None:

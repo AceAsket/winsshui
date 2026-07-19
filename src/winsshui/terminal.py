@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
-from winsshui.models import SshHost, TerminalLaunchMode
+from winsshui.models import PaneDirection, SshHost, TerminalLaunchMode, WorkspaceItem
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,28 +135,40 @@ class WindowsTerminalLauncher:
 
     def create_workspace_command(
         self,
-        items: list[tuple[SshHost, TerminalLaunchMode]],
+        items: list[tuple[SshHost, WorkspaceItem | TerminalLaunchMode]],
         window_name: str = "winsshui",
     ) -> list[str]:
         if not items:
             raise ValueError("workspace cannot be empty")
         command = ["wt.exe", "-w", window_name]
-        for index, (host, mode) in enumerate(items):
+        for index, (host, definition) in enumerate(items):
+            item = (
+                definition
+                if isinstance(definition, WorkspaceItem)
+                else WorkspaceItem(host.alias, definition)
+            )
             if index:
                 command.append(";")
-            if index == 0 or mode is TerminalLaunchMode.NEW_TAB:
+            if index == 0 or item.mode is TerminalLaunchMode.NEW_TAB:
                 command.append("new-tab")
             else:
-                command.extend(["split-pane", "-V"])
-            command.extend(["--title", host.alias, "ssh.exe", host.alias])
+                direction = "-H" if item.split_direction is PaneDirection.HORIZONTAL else "-V"
+                command.extend(["split-pane", direction])
+                if item.split_size != 0.5:
+                    command.extend(["--size", f"{max(0.1, min(0.9, item.split_size)):.2f}"])
+            command.extend(["--title", item.title or host.alias])
+            if item.tab_color:
+                command.extend(["--tabColor", item.tab_color])
+            command.extend(["ssh.exe", host.alias])
         return command
 
     def launch_workspace(
         self,
-        items: list[tuple[SshHost, TerminalLaunchMode]],
+        items: list[tuple[SshHost, WorkspaceItem | TerminalLaunchMode]],
+        window_name: str = "winsshui",
     ) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
-            self.create_workspace_command(items),
+            self.create_workspace_command(items, window_name),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             close_fds=True,
         )
@@ -217,7 +229,12 @@ class WinScpLauncher:
                 candidates.append(Path(root) / "WinSCP" / "WinSCP.exe")
         return str(next((path for path in candidates if path.exists()), "")) or None
 
-    def create_command(self, host: SshHost) -> list[str]:
+    def create_command(
+        self,
+        host: SshHost,
+        remote_path: str | None = None,
+        new_instance: bool = False,
+    ) -> list[str]:
         if not self.executable_path:
             raise FileNotFoundError("WinSCP.exe не найден")
         hostname = (host.hostname or host.alias).strip()
@@ -225,12 +242,26 @@ class WinScpLauncher:
             hostname = f"[{hostname}]"
         user = f"{quote(host.user, safe='')}@" if host.user else ""
         port = host.port or 22
-        url = f"sftp://{user}{hostname}:{port}/"
+        path = (remote_path or "/").strip() or "/"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        url = f"sftp://{user}{hostname}:{port}{quote(path, safe='/')}"
+        if path.endswith("/") and not url.endswith("/"):
+            url += "/"
         command = [self.executable_path, url]
+        if new_instance:
+            command.append("/newinstance")
         if host.identity_file:
             identity = str(Path(host.identity_file).expanduser())
             command.append(f"/privatekey={identity}")
         return command
 
-    def launch(self, host: SshHost) -> subprocess.Popen[bytes]:
-        return subprocess.Popen(self.create_command(host), close_fds=True)
+    def launch(
+        self,
+        host: SshHost,
+        remote_path: str | None = None,
+        new_instance: bool = False,
+    ) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            self.create_command(host, remote_path, new_instance), close_fds=True
+        )

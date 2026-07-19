@@ -10,6 +10,11 @@ class TerminalLaunchMode(StrEnum):
     SPLIT_RIGHT = "SplitRight"
 
 
+class PaneDirection(StrEnum):
+    VERTICAL = "Vertical"
+    HORIZONTAL = "Horizontal"
+
+
 @dataclass(frozen=True, slots=True)
 class SshHost:
     alias: str
@@ -69,6 +74,7 @@ class ConnectionMetadata:
     icon_name: str | None = None
     notes: str | None = None
     tags: tuple[str, ...] = ()
+    remote_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +82,16 @@ class TunnelPreferences:
     alias: str
     auto_restart: bool = False
     start_with_app: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionHealth:
+    alias: str
+    checked_at_utc: str
+    status: str
+    summary: str
+    latency_ms: int | None = None
+    last_success_at_utc: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +110,10 @@ class HistoryEntry:
 class WorkspaceItem:
     alias: str
     mode: TerminalLaunchMode
+    split_direction: PaneDirection = PaneDirection.VERTICAL
+    split_size: float = 0.5
+    title: str | None = None
+    tab_color: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +121,7 @@ class Workspace:
     id: int
     name: str
     items: tuple[WorkspaceItem, ...] = ()
+    window_name: str = "winsshui"
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +145,7 @@ class ConnectionItem:
     icon_name: str | None = None
     notes: str | None = None
     tags: tuple[str, ...] = ()
+    remote_path: str | None = None
 
     @property
     def alias(self) -> str:
@@ -146,4 +168,5 @@ class ConnectionItem:
             self.icon_name,
             self.notes,
             self.tags,
+            self.remote_path,
         )

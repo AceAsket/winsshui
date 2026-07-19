@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from winsshui.models import SshHost, TerminalLaunchMode
+from winsshui.models import PaneDirection, SshHost, TerminalLaunchMode, WorkspaceItem
 from winsshui.terminal import ManagedTunnelCommand, WindowsTerminalLauncher, WinScpLauncher
 
 
@@ -59,6 +59,25 @@ class WindowsTerminalLauncherTests(unittest.TestCase):
         self.assertEqual("prod", environment["WINSSHUI_CREDENTIAL_ALIAS"])
         self.assertNotIn("test-secret", " ".join(arguments))
 
+    def test_workspace_applies_split_size_title_color_and_window(self) -> None:
+        command = WindowsTerminalLauncher().create_workspace_command(
+            [
+                (SshHost("app"), WorkspaceItem("app", TerminalLaunchMode.NEW_TAB)),
+                (
+                    SshHost("db"),
+                    WorkspaceItem(
+                        "db", TerminalLaunchMode.SPLIT_RIGHT,
+                        PaneDirection.HORIZONTAL, 0.4, "DB", "#336699",
+                    ),
+                ),
+            ],
+            "production",
+        )
+        self.assertEqual(["wt.exe", "-w", "production"], command[:3])
+        self.assertIn("-H", command)
+        self.assertIn("0.40", command)
+        self.assertIn("#336699", command)
+
     def test_builds_winscp_url_without_password(self) -> None:
         command = WinScpLauncher(r"C:\Tools\WinSCP.exe").create_command(
             SshHost("prod", "2001:db8::1", "deploy user", 2222, r"C:\keys\id key")
@@ -66,6 +85,13 @@ class WindowsTerminalLauncherTests(unittest.TestCase):
         self.assertEqual(r"C:\Tools\WinSCP.exe", command[0])
         self.assertEqual("sftp://deploy%20user@[2001:db8::1]:2222/", command[1])
         self.assertEqual(r"/privatekey=C:\keys\id key", command[2])
+
+    def test_winscp_uses_remote_path_and_new_instance(self) -> None:
+        command = WinScpLauncher(r"C:\Tools\WinSCP.exe").create_command(
+            SshHost("prod", "prod.test", "deploy"), "/var/www/site files/", True
+        )
+        self.assertEqual("sftp://deploy@prod.test:22/var/www/site%20files/", command[1])
+        self.assertIn("/newinstance", command)
 
 
 if __name__ == "__main__":

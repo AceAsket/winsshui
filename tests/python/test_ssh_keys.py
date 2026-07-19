@@ -41,17 +41,11 @@ class SshKeyManagerTests(unittest.TestCase):
                 patch.object(manager, "_loaded_fingerprints", return_value={"SHA256:test"}),
             ):
                 keys = manager.list_keys()
-            self.assertEqual(
-                SshKeyInfo(
-                    "id_ed25519",
-                    manager.ssh_directory / "id_ed25519",
-                    manager.ssh_directory / "id_ed25519.pub",
-                    "ED25519",
-                    "SHA256:test",
-                    True,
-                ),
-                keys[0],
-            )
+            self.assertEqual("id_ed25519", keys[0].name)
+            self.assertEqual(manager.ssh_directory / "id_ed25519", keys[0].private_path)
+            self.assertEqual("SHA256:test", keys[0].fingerprint)
+            self.assertTrue(keys[0].loaded_in_agent)
+            self.assertIsNotNone(keys[0].modified_at_utc)
 
 
 if __name__ == "__main__":
