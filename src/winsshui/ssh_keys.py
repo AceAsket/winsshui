@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -15,6 +16,21 @@ class SshKeyInfo:
     key_type: str
     fingerprint: str
     loaded_in_agent: bool
+    modified_at_utc: datetime | None = None
+
+    @property
+    def age_days(self) -> int | None:
+        if not self.modified_at_utc:
+            return None
+        return max(0, (datetime.now(UTC) - self.modified_at_utc).days)
+
+    @property
+    def lifecycle_warning(self) -> str:
+        if self.key_type.casefold() in {"dsa", "unknown", "неизвестно"}:
+            return "Проверьте алгоритм"
+        if self.age_days is not None and self.age_days >= 730:
+            return "Старше 2 лет"
+        return "Норма"
 
 
 class SshKeyManager:
@@ -47,6 +63,10 @@ class SshKeyManager:
             except (OSError, IndexError):
                 pass
             fingerprint = self.fingerprint(public_path)
+            try:
+                modified_at = datetime.fromtimestamp(public_path.stat().st_mtime, UTC)
+            except OSError:
+                modified_at = None
             results.append(
                 SshKeyInfo(
                     private_path.name,
@@ -55,6 +75,7 @@ class SshKeyManager:
                     key_type,
                     fingerprint,
                     fingerprint in loaded,
+                    modified_at,
                 )
             )
         return results

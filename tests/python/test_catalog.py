@@ -7,6 +7,8 @@ from pathlib import Path
 from winsshui.catalog import ConnectionCatalog
 from winsshui.models import (
     ConnectionMetadata,
+    ConnectionHealth,
+    PaneDirection,
     TerminalLaunchMode,
     TunnelPreferences,
     WorkspaceItem,
@@ -26,6 +28,7 @@ class ConnectionCatalogTests(unittest.TestCase):
                     icon_name="database",
                     notes="Primary database",
                     tags=("Linux", "Production"),
+                    remote_path="/var/lib/app",
                 )
             )
             catalog.record_launch(
@@ -40,6 +43,7 @@ class ConnectionCatalogTests(unittest.TestCase):
             self.assertEqual("database", metadata.icon_name)
             self.assertEqual("Primary database", metadata.notes)
             self.assertEqual(("Linux", "Production"), metadata.tags)
+            self.assertEqual("/var/lib/app", metadata.remote_path)
             self.assertEqual("prod", history[0].alias)
             self.assertEqual("SplitRight", history[0].mode)
 
@@ -82,10 +86,15 @@ class ConnectionCatalogTests(unittest.TestCase):
                 "Production",
                 (
                     WorkspaceItem("app", TerminalLaunchMode.NEW_TAB),
-                    WorkspaceItem("db", TerminalLaunchMode.SPLIT_RIGHT),
+                    WorkspaceItem(
+                        "db", TerminalLaunchMode.SPLIT_RIGHT,
+                        PaneDirection.HORIZONTAL, 0.4, "Database", "#336699",
+                    ),
                 ),
+                "production-window",
             )
             self.assertEqual(saved, catalog.get_workspaces()[0])
+            self.assertEqual("production-window", saved.window_name)
             catalog.delete_workspace(saved.id)
             self.assertEqual([], catalog.get_workspaces())
 
@@ -143,6 +152,17 @@ class ConnectionCatalogTests(unittest.TestCase):
             self.assertIn("gateway-new", catalog.get_tunnel_preferences())
             catalog.delete_metadata("gateway-new")
             self.assertEqual({}, catalog.get_tunnel_preferences())
+
+    def test_connection_health_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="winsshui-tests-") as directory:
+            catalog = ConnectionCatalog(Path(directory) / "catalog.db")
+            catalog.initialize()
+            health = ConnectionHealth(
+                "prod", "2026-07-19T20:00:00+00:00", "ok", "Работает", 123,
+                "2026-07-19T20:00:00+00:00",
+            )
+            catalog.save_connection_health(health)
+            self.assertEqual(health, catalog.get_connection_health()["prod"])
 
     def test_initialization_migrates_pre_02_catalog(self) -> None:
         with tempfile.TemporaryDirectory(prefix="winsshui-tests-") as directory:

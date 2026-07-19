@@ -2,6 +2,7 @@ import unittest
 
 from winsshui.key_install import (
     create_public_key_install_command,
+    create_public_key_removal_command,
     normalize_public_key,
 )
 
@@ -31,6 +32,12 @@ class PublicKeyInstallTests(unittest.TestCase):
             normalize_public_key(self.key + "\nssh-rsa AAAA")
         with self.assertRaises(ValueError):
             normalize_public_key("unknown AAAA")
+
+    def test_removal_sends_key_through_stdin(self) -> None:
+        command = create_public_key_removal_command("ssh.exe", "prod", self.key)
+        self.assertNotIn(self.key, " ".join(command.arguments))
+        self.assertIn(b"ssh-ed25519", command.standard_input)
+        self.assertIn("StrictHostKeyChecking=yes", command.arguments)
 
 
 if __name__ == "__main__":

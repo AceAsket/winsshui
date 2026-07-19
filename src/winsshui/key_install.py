@@ -20,6 +20,18 @@ _VERIFY_SCRIPT = (
     'IFS= read -r key && grep -qxF "$key" "$HOME/.ssh/authorized_keys"'
 )
 
+_REMOVE_SCRIPT = (
+    'file="$HOME/.ssh/authorized_keys"; test -f "$file" || exit 3; '
+    'tmp="${file}.winsshui.$$"; trap \'rm -f "$tmp"\' EXIT HUP INT TERM; '
+    'IFS= read -r key && { grep -vxF "$key" "$file" > "$tmp" || true; } && '
+    'cat "$tmp" > "$file" && chmod 600 "$file"'
+)
+
+_VERIFY_ABSENT_SCRIPT = (
+    'file="$HOME/.ssh/authorized_keys"; IFS= read -r key && '
+    '{ test ! -f "$file" || ! grep -qxF "$key" "$file"; }'
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PublicKeyInstallCommand:
@@ -64,4 +76,27 @@ def create_public_key_install_command(
         ssh_path,
         tuple([*options, "--", normalized_alias, script]),
         f"{normalized_key}\n".encode("utf-8"),
+    )
+
+
+def create_public_key_removal_command(
+    ssh_path: str,
+    alias: str,
+    public_key: str,
+    *,
+    verify: bool = False,
+    identity_file: str | None = None,
+) -> PublicKeyInstallCommand:
+    normalized_alias = alias.strip()
+    if not ssh_path.strip() or not normalized_alias or any(c in normalized_alias for c in "\r\n"):
+        raise ValueError("Некорректные параметры SSH")
+    normalized_key = normalize_public_key(public_key)
+    arguments = ["-T", "-o", "StrictHostKeyChecking=yes"]
+    if verify:
+        arguments.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+        if identity_file:
+            arguments.extend(["-o", "IdentitiesOnly=yes", "-i", identity_file])
+    arguments.extend(["--", normalized_alias, _VERIFY_ABSENT_SCRIPT if verify else _REMOVE_SCRIPT])
+    return PublicKeyInstallCommand(
+        ssh_path, tuple(arguments), f"{normalized_key}\n".encode("utf-8")
     )

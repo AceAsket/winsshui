@@ -10,8 +10,10 @@ from pathlib import Path
 
 from winsshui.models import (
     ConnectionMetadata,
+    ConnectionHealth,
     CommandSnippet,
     HistoryEntry,
+    PaneDirection,
     TerminalLaunchMode,
     TunnelPreferences,
     Workspace,
@@ -46,7 +48,8 @@ class ConnectionCatalog:
                         last_synced_at_utc TEXT NULL,
                         icon_name TEXT NULL,
                         notes TEXT NULL,
-                        tags TEXT NULL
+                        tags TEXT NULL,
+                        remote_path TEXT NULL
                     );
 
                     CREATE TABLE IF NOT EXISTS connection_history (
@@ -61,7 +64,8 @@ class ConnectionCatalog:
 
                     CREATE TABLE IF NOT EXISTS workspaces (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                        window_name TEXT NOT NULL DEFAULT 'winsshui'
                     );
 
                     CREATE TABLE IF NOT EXISTS workspace_items (
@@ -69,6 +73,10 @@ class ConnectionCatalog:
                         position INTEGER NOT NULL,
                         alias TEXT NOT NULL,
                         mode TEXT NOT NULL,
+                        split_direction TEXT NOT NULL DEFAULT 'Vertical',
+                        split_size REAL NOT NULL DEFAULT 0.5,
+                        title TEXT NULL,
+                        tab_color TEXT NULL,
                         PRIMARY KEY(workspace_id, position)
                     );
 
@@ -98,6 +106,15 @@ class ConnectionCatalog:
                         auto_restart INTEGER NOT NULL DEFAULT 0,
                         start_with_app INTEGER NOT NULL DEFAULT 0
                     );
+
+                    CREATE TABLE IF NOT EXISTS connection_health (
+                        alias TEXT PRIMARY KEY COLLATE NOCASE,
+                        checked_at_utc TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        latency_ms INTEGER NULL,
+                        last_success_at_utc TEXT NULL
+                    );
                     """
                 )
                 columns = {
@@ -113,9 +130,31 @@ class ConnectionCatalog:
                     "icon_name",
                     "notes",
                     "tags",
+                    "remote_path",
                 ):
                     if name not in columns:
                         connection.execute(f"ALTER TABLE connection_metadata ADD COLUMN {name} TEXT NULL")
+                workspace_columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(workspaces)").fetchall()
+                }
+                if "window_name" not in workspace_columns:
+                    connection.execute(
+                        "ALTER TABLE workspaces ADD COLUMN window_name TEXT NOT NULL DEFAULT 'winsshui'"
+                    )
+                item_columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(workspace_items)").fetchall()
+                }
+                item_migrations = {
+                    "split_direction": "TEXT NOT NULL DEFAULT 'Vertical'",
+                    "split_size": "REAL NOT NULL DEFAULT 0.5",
+                    "title": "TEXT NULL",
+                    "tab_color": "TEXT NULL",
+                }
+                for name, definition in item_migrations.items():
+                    if name not in item_columns:
+                        connection.execute(
+                            f"ALTER TABLE workspace_items ADD COLUMN {name} {definition}"
+                        )
                 connection.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS ux_connection_metadata_origin
@@ -130,7 +169,7 @@ class ConnectionCatalog:
                 """
                 SELECT alias, is_favorite, group_name, origin_type, origin_identifier,
                        source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name,
-                       notes, tags
+                       notes, tags, remote_path
                 FROM connection_metadata
                 """
             ).fetchall()
@@ -147,6 +186,7 @@ class ConnectionCatalog:
                 row["icon_name"],
                 row["notes"],
                 self._decode_tags(row["tags"]),
+                row["remote_path"],
             )
             for row in rows
         }
@@ -159,9 +199,9 @@ class ConnectionCatalog:
                 INSERT INTO connection_metadata(
                     alias, is_favorite, group_name, origin_type, origin_identifier,
                     source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name,
-                    notes, tags
+                    notes, tags, remote_path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(alias) DO UPDATE SET
                     is_favorite = excluded.is_favorite,
                     group_name = excluded.group_name,
@@ -172,7 +212,8 @@ class ConnectionCatalog:
                     last_synced_at_utc = excluded.last_synced_at_utc,
                     icon_name = excluded.icon_name,
                     notes = excluded.notes,
-                    tags = excluded.tags
+                    tags = excluded.tags,
+                    remote_path = excluded.remote_path
                 """,
                 (
                     metadata.alias,
@@ -186,6 +227,7 @@ class ConnectionCatalog:
                     metadata.icon_name,
                     self._normalize_notes(metadata.notes),
                     self._encode_tags(metadata.tags),
+                    self._normalize_remote_path(metadata.remote_path),
                 ),
             )
 
@@ -201,9 +243,9 @@ class ConnectionCatalog:
                 INSERT INTO connection_metadata(
                     alias, is_favorite, group_name, origin_type, origin_identifier,
                     source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name,
-                    notes, tags
+                    notes, tags, remote_path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(alias) DO UPDATE SET
                     is_favorite = excluded.is_favorite,
                     group_name = excluded.group_name,
@@ -214,7 +256,8 @@ class ConnectionCatalog:
                     last_synced_at_utc = excluded.last_synced_at_utc,
                     icon_name = excluded.icon_name,
                     notes = excluded.notes,
-                    tags = excluded.tags
+                    tags = excluded.tags,
+                    remote_path = excluded.remote_path
                 """,
                 (
                     metadata.alias,
@@ -228,6 +271,7 @@ class ConnectionCatalog:
                     metadata.icon_name,
                     self._normalize_notes(metadata.notes),
                     self._encode_tags(metadata.tags),
+                    self._normalize_remote_path(metadata.remote_path),
                 ),
             )
             if original_alias.casefold() != metadata.alias.casefold():
@@ -243,6 +287,10 @@ class ConnectionCatalog:
                     "UPDATE tunnel_preferences SET alias = ? WHERE alias = ? COLLATE NOCASE",
                     (metadata.alias, original_alias),
                 )
+                connection.execute(
+                    "UPDATE connection_health SET alias = ? WHERE alias = ? COLLATE NOCASE",
+                    (metadata.alias, original_alias),
+                )
 
     def delete_metadata(self, alias: str) -> None:
         with self._lock, self._connection() as connection:
@@ -256,6 +304,10 @@ class ConnectionCatalog:
             )
             connection.execute(
                 "DELETE FROM tunnel_preferences WHERE alias = ? COLLATE NOCASE",
+                (alias,),
+            )
+            connection.execute(
+                "DELETE FROM connection_health WHERE alias = ? COLLATE NOCASE",
                 (alias,),
             )
 
@@ -282,6 +334,48 @@ class ConnectionCatalog:
                     start_with_app = excluded.start_with_app
                 """,
                 (preferences.alias, preferences.auto_restart, preferences.start_with_app),
+            )
+
+    def get_connection_health(self) -> dict[str, ConnectionHealth]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT alias, checked_at_utc, status, summary, latency_ms, last_success_at_utc "
+                "FROM connection_health"
+            ).fetchall()
+        return {
+            row["alias"].casefold(): ConnectionHealth(
+                row["alias"],
+                row["checked_at_utc"],
+                row["status"],
+                row["summary"],
+                row["latency_ms"],
+                row["last_success_at_utc"],
+            )
+            for row in rows
+        }
+
+    def save_connection_health(self, health: ConnectionHealth) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO connection_health(
+                    alias, checked_at_utc, status, summary, latency_ms, last_success_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(alias) DO UPDATE SET
+                    checked_at_utc = excluded.checked_at_utc,
+                    status = excluded.status,
+                    summary = excluded.summary,
+                    latency_ms = excluded.latency_ms,
+                    last_success_at_utc = excluded.last_success_at_utc
+                """,
+                (
+                    health.alias,
+                    health.checked_at_utc,
+                    health.status,
+                    health.summary,
+                    health.latency_ms,
+                    health.last_success_at_utc,
+                ),
             )
 
     def record_launch(
@@ -329,11 +423,11 @@ class ConnectionCatalog:
     def get_workspaces(self) -> list[Workspace]:
         with self._lock, self._connection() as connection:
             workspace_rows = connection.execute(
-                "SELECT id, name FROM workspaces ORDER BY name COLLATE NOCASE"
+                "SELECT id, name, window_name FROM workspaces ORDER BY name COLLATE NOCASE"
             ).fetchall()
             item_rows = connection.execute(
                 """
-                SELECT workspace_id, alias, mode
+                SELECT workspace_id, alias, mode, split_direction, split_size, title, tab_color
                 FROM workspace_items
                 ORDER BY workspace_id, position
                 """
@@ -344,19 +438,36 @@ class ConnectionCatalog:
                 mode = TerminalLaunchMode(row["mode"])
             except ValueError:
                 mode = TerminalLaunchMode.NEW_TAB
+            try:
+                direction = PaneDirection(row["split_direction"])
+            except ValueError:
+                direction = PaneDirection.VERTICAL
             items_by_workspace.setdefault(row["workspace_id"], []).append(
-                WorkspaceItem(row["alias"], mode)
+                WorkspaceItem(
+                    row["alias"],
+                    mode,
+                    direction,
+                    float(row["split_size"]),
+                    row["title"],
+                    row["tab_color"],
+                )
             )
         return [
             Workspace(
                 row["id"],
                 row["name"],
                 tuple(items_by_workspace.get(row["id"], [])),
+                row["window_name"] or "winsshui",
             )
             for row in workspace_rows
         ]
 
-    def save_workspace(self, name: str, items: tuple[WorkspaceItem, ...]) -> Workspace:
+    def save_workspace(
+        self,
+        name: str,
+        items: tuple[WorkspaceItem, ...],
+        window_name: str = "winsshui",
+    ) -> Workspace:
         normalized_name = name.strip()
         if not normalized_name:
             raise ValueError("Укажите название рабочего пространства")
@@ -365,10 +476,12 @@ class ConnectionCatalog:
         with self._lock, self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO workspaces(name) VALUES (?)
-                ON CONFLICT(name) DO UPDATE SET name = excluded.name
+                INSERT INTO workspaces(name, window_name) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    name = excluded.name,
+                    window_name = excluded.window_name
                 """,
-                (normalized_name,),
+                (normalized_name, window_name.strip() or "winsshui"),
             )
             workspace_id = connection.execute(
                 "SELECT id FROM workspaces WHERE name = ? COLLATE NOCASE",
@@ -380,15 +493,27 @@ class ConnectionCatalog:
             )
             connection.executemany(
                 """
-                INSERT INTO workspace_items(workspace_id, position, alias, mode)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO workspace_items(
+                    workspace_id, position, alias, mode, split_direction,
+                    split_size, title, tab_color
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (workspace_id, position, item.alias, item.mode.value)
+                    (
+                        workspace_id,
+                        position,
+                        item.alias,
+                        item.mode.value,
+                        item.split_direction.value,
+                        max(0.1, min(0.9, item.split_size)),
+                        item.title.strip() if item.title and item.title.strip() else None,
+                        item.tab_color,
+                    )
                     for position, item in enumerate(items)
                 ],
             )
-        return Workspace(workspace_id, normalized_name, items)
+        return Workspace(workspace_id, normalized_name, items, window_name.strip() or "winsshui")
 
     def delete_workspace(self, workspace_id: int) -> None:
         with self._lock, self._connection() as connection:
@@ -484,6 +609,13 @@ class ConnectionCatalog:
     @staticmethod
     def _normalize_notes(notes: str | None) -> str | None:
         normalized = notes.strip() if notes else ""
+        return normalized or None
+
+    @staticmethod
+    def _normalize_remote_path(remote_path: str | None) -> str | None:
+        normalized = remote_path.strip() if remote_path else ""
+        if "\r" in normalized or "\n" in normalized:
+            raise ValueError("Удалённый путь не может содержать перевод строки")
         return normalized or None
 
     @staticmethod
