@@ -28,6 +28,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window = MainWindow(root / "data")
             try:
                 self.assertEqual("WinSSH UI", window.windowTitle())
+                self.assertEqual("WinSSH UI 0.5.0", window.version_label.text())
                 self.assertEqual(0, window.connection_list.topLevelItemCount())
                 self.assertFalse(window.connect_button.isEnabled())
                 self.assertFalse(window.host_key_button.isEnabled())
