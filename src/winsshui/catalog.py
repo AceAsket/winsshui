@@ -406,7 +406,6 @@ class ConnectionCatalog:
                 "SELECT value FROM app_settings WHERE key = 'session.current'"
             ).fetchone()
             session = self._decode_session(None if row is None else row["value"])
-            session = [entry for entry in session if entry[0].casefold() != alias.casefold()]
             session.append((alias, mode))
             connection.execute(
                 "INSERT INTO app_settings(key, value) VALUES ('session.current', ?) "

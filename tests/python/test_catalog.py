@@ -138,7 +138,7 @@ class ConnectionCatalogTests(unittest.TestCase):
                 catalog.get_setting("updates.last_checked_utc"),
             )
 
-    def test_previous_session_is_deduplicated_and_rotated(self) -> None:
+    def test_previous_session_preserves_duplicate_instances_and_rotates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             catalog = ConnectionCatalog(Path(directory) / "catalog.db")
             catalog.initialize()
@@ -149,6 +149,7 @@ class ConnectionCatalogTests(unittest.TestCase):
             previous = catalog.begin_session()
             self.assertEqual(
                 (
+                    ("router", TerminalLaunchMode.NEW_TAB),
                     ("server", TerminalLaunchMode.SPLIT_RIGHT),
                     ("router", TerminalLaunchMode.SPLIT_RIGHT),
                 ),
