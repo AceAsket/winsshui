@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 import shutil
+import logging
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QPoint, QProcess, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QIODevice, QPoint, QProcess, QSaveFile, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -18,6 +21,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -25,6 +29,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QScrollArea,
     QSplitter,
     QTreeWidget,
@@ -38,6 +43,7 @@ from winsshui import __version__
 from winsshui.backup import BackupManager
 from winsshui.catalog import ConnectionCatalog
 from winsshui.dialogs import (
+    ApplicationLogDialog,
     CommandSnippetsDialog,
     DiagnosticsDialog,
     ImportConnectionsDialog,
@@ -45,6 +51,7 @@ from winsshui.dialogs import (
     SshKeyManagerDialog,
     WorkspaceDialog,
 )
+from winsshui.credentials import WindowsCredentialStore
 from winsshui.diagnostics import SshDiagnostics
 from winsshui.device_icons import (
     DEVICE_ICON_OPTIONS,
@@ -72,11 +79,17 @@ from winsshui.terminal import (
     WinScpLauncher,
     detect_tools,
 )
-from winsshui.updates import LATEST_RELEASE_API, is_newer_version, parse_latest_release
+from winsshui.updates import (
+    LATEST_RELEASE_API,
+    ReleaseInfo,
+    expected_sha256,
+    is_newer_version,
+    parse_latest_release,
+)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, app_data_directory: Path) -> None:
+    def __init__(self, app_data_directory: Path, log_path: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle("WinSSH UI")
         self.resize(1120, 760)
@@ -84,6 +97,8 @@ class MainWindow(QMainWindow):
 
         self.config_path = Path.home() / ".ssh" / "config"
         self.app_data_directory = app_data_directory.resolve()
+        self.log_path = (log_path or app_data_directory / "logs" / "winsshui.log").resolve()
+        self.logger = logging.getLogger(__name__)
         self.catalog = ConnectionCatalog(app_data_directory / "catalog.db")
         self.backup_manager = BackupManager(
             Path.home() / ".ssh",
@@ -109,8 +124,18 @@ class MainWindow(QMainWindow):
         self._effective_configuration: EffectiveSshConfiguration | None = None
         self._tunnel_processes: dict[str, QProcess] = {}
         self._stopping_tunnels: set[str] = set()
+        try:
+            self.credential_store: WindowsCredentialStore | None = WindowsCredentialStore()
+        except OSError:
+            self.credential_store = None
         self._update_manager = QNetworkAccessManager(self)
         self._update_reply: QNetworkReply | None = None
+        self._download_reply: QNetworkReply | None = None
+        self._download_file: QSaveFile | None = None
+        self._download_hash: Any | None = None
+        self._download_expected: str | None = None
+        self._download_destination: Path | None = None
+        self._download_progress: QProgressDialog | None = None
 
         self._build_ui()
         self._apply_style()
@@ -319,6 +344,12 @@ class MainWindow(QMainWindow):
             self.host_key_button.setToolTip("ssh-keygen.exe не найден в PATH")
         security_actions.addWidget(self.diagnostics_button)
         security_actions.addWidget(self.host_key_button)
+        self.password_button = QPushButton("Сохранить пароль")
+        self.password_button.clicked.connect(self._manage_password)
+        self.password_button.setToolTip(
+            "Пароль хранится в Windows Credential Manager и не записывается в каталог приложения"
+        )
+        security_actions.addWidget(self.password_button)
         security_actions.addStretch()
         layout.addLayout(security_actions)
 
@@ -971,6 +1002,11 @@ class MainWindow(QMainWindow):
                     connection.icon_name,
                 ),
             )
+            if self.credential_store and draft.alias.casefold() != connection.alias.casefold():
+                try:
+                    self.credential_store.rename(connection.alias, draft.alias)
+                except OSError:
+                    self.logger.exception("Could not migrate credential after alias rename")
             self.reload_connections()
             self._rebuild_connection_list(draft.alias)
             self.status_label.setText(
@@ -1043,6 +1079,11 @@ class MainWindow(QMainWindow):
         try:
             result = self.config_writer.delete(source_path, connection.alias)
             self.catalog.delete_metadata(connection.alias)
+            if self.credential_store:
+                try:
+                    self.credential_store.delete(connection.alias)
+                except OSError:
+                    self.logger.exception("Could not delete credential for removed connection")
             self.reload_connections()
             self.status_label.setText(
                 f"Подключение {connection.alias} удалено; резервная копия: {result.backup_path}"
@@ -1204,6 +1245,7 @@ class MainWindow(QMainWindow):
             self.favorite_button.setText("☆")
             self.favorite_button.setToolTip("Добавить в избранное")
             self._update_tunnel_button(None)
+            self.password_button.setText("Сохранить пароль")
             return
 
         self._set_details_enabled(True)
@@ -1235,6 +1277,7 @@ class MainWindow(QMainWindow):
         )
         self._resolve_effective_configuration(connection)
         self._update_tunnel_button(connection)
+        self._update_password_button(connection)
 
     def _set_details_enabled(self, has_selection: bool) -> None:
         can_connect = has_selection and self.tools.can_connect
@@ -1246,6 +1289,7 @@ class MainWindow(QMainWindow):
         self.save_group_button.setEnabled(has_selection)
         self.host_key_button.setEnabled(has_selection and self.host_key_manager.available)
         self.diagnostics_button.setEnabled(has_selection and self.tools.ssh_path is not None)
+        self.password_button.setEnabled(has_selection and self.credential_store is not None)
         self.edit_button.setEnabled(has_selection)
         self.clone_button.setEnabled(has_selection)
         self.snippets_button.setEnabled(has_selection)
@@ -1319,6 +1363,12 @@ class MainWindow(QMainWindow):
         if self._update_reply is not None:
             self._update_reply.abort()
             self._update_reply = None
+        if self._download_reply is not None:
+            self._download_reply.abort()
+            self._download_reply = None
+        if self._download_file is not None:
+            self._download_file.cancelWriting()
+            self._download_file = None
         process = self._resolve_process
         self._resolve_process = None
         self._resolved_alias = None
@@ -1439,12 +1489,94 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         update_action = menu.addAction(f"Проверить обновления…  (версия {__version__})")
         update_action.triggered.connect(lambda: self._check_updates(silent=False))
+        log_action = menu.addAction("Журнал и диагностика…")
+        log_action.triggered.connect(self._show_application_log)
         menu.addSeparator()
         export_action = menu.addAction("Экспортировать резервную копию…")
         export_action.triggered.connect(self._export_backup)
         restore_action = menu.addAction("Восстановить из копии…")
         restore_action.triggered.connect(self._restore_backup)
         menu.exec(self.data_button.mapToGlobal(QPoint(0, self.data_button.height())))
+
+    def _show_application_log(self) -> None:
+        ApplicationLogDialog(self.log_path, self).exec()
+
+    def _manage_password(self) -> None:
+        connection = self._selected_connection()
+        store = self.credential_store
+        if not connection or store is None:
+            return
+        try:
+            if store.contains(connection.alias):
+                dialog = QMessageBox(self)
+                dialog.setWindowTitle("Сохранённый SSH-пароль")
+                dialog.setIcon(QMessageBox.Icon.Information)
+                dialog.setText(
+                    f"Для {connection.alias} сохранён пароль в Windows Credential Manager."
+                )
+                replace_button = dialog.addButton(
+                    "Заменить…", QMessageBox.ButtonRole.AcceptRole
+                )
+                delete_button = dialog.addButton(
+                    "Удалить", QMessageBox.ButtonRole.DestructiveRole
+                )
+                dialog.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+                dialog.exec()
+                if dialog.clickedButton() is delete_button:
+                    store.delete(connection.alias)
+                    self._update_password_button(connection)
+                    self.status_label.setText(f"Сохранённый пароль {connection.alias} удалён")
+                    return
+                if dialog.clickedButton() is not replace_button:
+                    return
+            password, accepted = QInputDialog.getText(
+                self,
+                "SSH-пароль",
+                f"Пароль для {connection.alias}:\nОн будет сохранён в Windows Credential Manager.",
+                QLineEdit.EchoMode.Password,
+            )
+            if not accepted:
+                return
+            user = connection.host.user
+            if (
+                self._effective_configuration
+                and self._effective_configuration.alias == connection.alias
+            ):
+                user = self._effective_configuration.user
+            store.save(connection.alias, user, password)
+            self._update_password_button(connection)
+            self.status_label.setText(
+                f"Пароль {connection.alias} сохранён в Windows Credential Manager"
+            )
+        except (OSError, ValueError) as exception:
+            self._show_error("Не удалось изменить сохранённый пароль", exception)
+
+    def _update_password_button(self, connection: ConnectionItem | None) -> None:
+        if not connection or self.credential_store is None:
+            self.password_button.setText("Сохранить пароль")
+            return
+        try:
+            saved = self.credential_store.contains(connection.alias)
+        except OSError:
+            saved = False
+        self.password_button.setText("Пароль сохранён" if saved else "Сохранить пароль")
+        if saved and not self.terminal_launcher.askpass_path:
+            self.password_button.setToolTip(
+                "Пароль сохранён, но WinSSH-AskPass.exe не найден; установите полный пакет"
+            )
+
+    def _credential_alias_for(self, connection: ConnectionItem) -> str | None:
+        if (
+            self.credential_store is None
+            or not self.terminal_launcher.askpass_path
+            or connection.host.proxy_jump
+        ):
+            return None
+        try:
+            return connection.alias if self.credential_store.contains(connection.alias) else None
+        except OSError:
+            self.logger.exception("Credential lookup failed for %s", connection.alias)
+            return None
 
     def _auto_check_updates(self) -> None:
         try:
@@ -1521,12 +1653,153 @@ class MainWindow(QMainWindow):
             notes = release.notes[:1200]
             details += f"\n\n{notes}{'…' if len(release.notes) > len(notes) else ''}"
         dialog.setInformativeText(details)
-        open_text = "Скачать EXE" if release.download_url else "Открыть страницу релиза"
+        verified_download = bool(
+            release.download_url and expected_sha256(release.asset_digest)
+        )
+        open_text = "Скачать и проверить" if verified_download else "Открыть страницу релиза"
         open_button = dialog.addButton(open_text, QMessageBox.ButtonRole.AcceptRole)
         dialog.addButton("Позже", QMessageBox.ButtonRole.RejectRole)
         dialog.exec()
         if dialog.clickedButton() is open_button:
-            QDesktopServices.openUrl(QUrl(release.download_url or release.page_url))
+            if verified_download:
+                self._start_update_download(release)
+            else:
+                QDesktopServices.openUrl(QUrl(release.page_url))
+
+    def _start_update_download(self, release: ReleaseInfo) -> None:
+        if self._download_reply is not None or not release.download_url:
+            return
+        expected = expected_sha256(release.asset_digest)
+        if not expected:
+            QMessageBox.warning(
+                self,
+                "Проверка обновления",
+                "GitHub не предоставил корректный SHA-256. Открываю страницу релиза.",
+            )
+            QDesktopServices.openUrl(QUrl(release.page_url))
+            return
+        downloads = Path.home() / "Downloads"
+        default_path = downloads / (release.asset_name or "WinSSH-UI-Update.exe")
+        filename, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить обновление",
+            str(default_path),
+            "Приложение Windows (*.exe)",
+        )
+        if not filename:
+            return
+        destination = Path(filename).resolve()
+        save_file = QSaveFile(str(destination))
+        if not save_file.open(QIODevice.OpenModeFlag.WriteOnly):
+            QMessageBox.warning(self, "Загрузка обновления", save_file.errorString())
+            return
+        request = QNetworkRequest(QUrl(release.download_url))
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+        )
+        request.setRawHeader(b"User-Agent", f"WinSSH-UI/{__version__}".encode("ascii"))
+        reply = self._update_manager.get(request)
+        progress = QProgressDialog("Загружаю обновление…", "Отмена", 0, 0, self)
+        progress.setWindowTitle(f"WinSSH UI {release.version}")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.canceled.connect(reply.abort)
+        reply.readyRead.connect(lambda: self._download_ready(reply))
+        reply.downloadProgress.connect(self._download_progress_changed)
+        reply.finished.connect(lambda: self._download_finished(reply, release))
+        self._download_reply = reply
+        self._download_file = save_file
+        self._download_hash = hashlib.sha256()
+        self._download_expected = expected
+        self._download_destination = destination
+        self._download_progress = progress
+        progress.show()
+        self.status_label.setText(f"Загружаю WinSSH UI {release.version}…")
+
+    def _download_ready(self, reply: QNetworkReply) -> None:
+        if reply is not self._download_reply or self._download_file is None:
+            return
+        data = bytes(reply.readAll())
+        if not data:
+            return
+        if self._download_file.write(data) != len(data):
+            reply.abort()
+            return
+        self._download_hash.update(data)
+
+    def _download_progress_changed(self, received: int, total: int) -> None:
+        progress = self._download_progress
+        if progress is None:
+            return
+        if total > 0:
+            progress.setRange(0, total)
+            progress.setValue(received)
+            progress.setLabelText(
+                f"Загружено {received / 1_048_576:.1f} из {total / 1_048_576:.1f} МБ"
+            )
+
+    def _download_finished(self, reply: QNetworkReply, release: ReleaseInfo) -> None:
+        if reply is not self._download_reply:
+            reply.deleteLater()
+            return
+        self._download_ready(reply)
+        save_file = self._download_file
+        checksum = self._download_hash.hexdigest() if self._download_hash else ""
+        expected = self._download_expected
+        destination = self._download_destination
+        progress = self._download_progress
+        error = reply.error()
+        error_text = reply.errorString()
+        self._download_reply = None
+        self._download_file = None
+        self._download_hash = None
+        self._download_expected = None
+        self._download_destination = None
+        self._download_progress = None
+        reply.deleteLater()
+        if progress:
+            progress.close()
+            progress.deleteLater()
+        if save_file is None or destination is None:
+            return
+        if error != QNetworkReply.NetworkError.NoError:
+            save_file.cancelWriting()
+            if error != QNetworkReply.NetworkError.OperationCanceledError:
+                QMessageBox.warning(self, "Загрузка обновления", error_text)
+            self.status_label.setText("Загрузка обновления отменена")
+            return
+        if checksum != expected:
+            save_file.cancelWriting()
+            self.logger.error(
+                "Update checksum mismatch for %s: expected=%s actual=%s",
+                release.tag_name,
+                expected,
+                checksum,
+            )
+            QMessageBox.critical(
+                self,
+                "Обновление отклонено",
+                "SHA-256 загруженного файла не совпал с GitHub Release. Файл удалён.",
+            )
+            return
+        if not save_file.commit():
+            QMessageBox.warning(self, "Сохранение обновления", save_file.errorString())
+            return
+        self.logger.info("Verified update %s saved to %s", release.tag_name, destination)
+        self.status_label.setText(f"Обновление проверено и сохранено: {destination}")
+        if destination.name.casefold().endswith("-setup.exe"):
+            answer = QMessageBox.question(
+                self,
+                "Обновление готово",
+                f"SHA-256 подтверждён. Запустить установщик WinSSH UI {release.version}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                QProcess.startDetached(str(destination), [])
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(destination.parent)))
 
     def _export_backup(self) -> None:
         default_name = f"winsshui-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
@@ -1591,6 +1864,7 @@ class MainWindow(QMainWindow):
                 connection.host,
                 snippet.command,
                 f"{connection.alias} · {snippet.name}",
+                self._credential_alias_for(connection),
             )
             self.status_label.setText(
                 f"Запускаю «{snippet.name}» на {connection.alias} в Windows Terminal…"
@@ -1840,10 +2114,17 @@ class MainWindow(QMainWindow):
         if not connection:
             return
         try:
-            self.terminal_launcher.launch(connection.host, mode)
+            credential_alias = self._credential_alias_for(connection)
+            self.terminal_launcher.launch(connection.host, mode, credential_alias)
             self.catalog.record_launch(connection.alias, mode)
             self._reload_history()
             self.status_label.setText(f"Открываю {connection.alias} в Windows Terminal…")
+            self.logger.info(
+                "Opened SSH connection %s in mode %s; authentication=%s",
+                connection.alias,
+                mode.value,
+                "credential-manager" if credential_alias else "key-or-interactive",
+            )
         except (OSError, ValueError) as exception:
             self._show_error("Не удалось запустить Windows Terminal", exception)
 
@@ -1904,5 +2185,11 @@ class MainWindow(QMainWindow):
         )
 
     def _show_error(self, title: str, exception: Exception) -> None:
+        self.logger.error(
+            "%s: %s",
+            title,
+            exception,
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
         self.status_label.setText(f"{title}: {exception}")
         QMessageBox.critical(self, title, str(exception))

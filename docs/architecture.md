@@ -14,7 +14,9 @@ PySide6 UI
   ├─ SshKeyManager → ~/.ssh + ssh-keygen/ssh-add
   ├─ CommandSnippet → sqlite3 → wt.exe → ssh.exe -t
   ├─ BackupManager → ZIP(manifest + configs + SQLite snapshot)
-  ├─ Update checker → GitHub Releases API → browser download
+  ├─ Update downloader → GitHub Releases API → QSaveFile + SHA-256
+  ├─ WindowsCredentialStore → CredWriteW/CredReadW → WinSSH-AskPass.exe
+  ├─ Rotating log → redaction → diagnostics ZIP
   ├─ ManagedTunnelCommand → ssh.exe -N -T
   ├─ ConnectionCatalog → sqlite3
   ├─ WindowsTerminalLauncher → wt.exe → ssh.exe <alias>
@@ -81,12 +83,14 @@ SuperPuTTY XML, FileZilla SFTP и незашифрованного mRemoteNG XML
 
 ### Пароли
 
-SQLite, SSH config, резервные ZIP и аргументы процессов не должны содержать
-пароли. Если поддержка паролей будет добавлена, секрет хранится как Generic
-Credential в Windows Credential Manager, а каталог содержит только стабильный
-идентификатор записи. По умолчанию предпочтительны ключи и `ssh-agent`; передача
-пароля OpenSSH потребует отдельного защищённого askpass-механизма и не должна
-происходить через командную строку или переменную окружения.
+SQLite, SSH config, резервные ZIP, журналы и аргументы процессов не содержат
+пароли. Секрет хранится как Generic Credential в Windows Credential Manager под
+хешированным идентификатором алиаса. `WinSSH-AskPass.exe` читает секрет в отдельном
+короткоживущем процессе; основное приложение передаёт OpenSSH только идентификатор
+через окружение и включает `SSH_ASKPASS_REQUIRE=force`. Helper отказывается
+отвечать на всё, кроме password prompt, поэтому не может автоматически принять
+неизвестный ключ хоста. Для ProxyJump и фоновых процессов предпочтительны ключи
+и `ssh-agent`.
 
 ### `WindowsTerminalLauncher`
 
@@ -140,15 +144,17 @@ Windows Terminal и OpenSSH намеренно не встраиваются и 
 
 Проверка обновлений асинхронно читает публичный endpoint последнего GitHub
 Release через `QNetworkAccessManager`, сравнивает числовую версию и сохраняет
-только время успешной проверки в SQLite. EXE не скачивается и не запускается
-автоматически: после согласия пользователя ссылка открывается системным браузером.
+только время проверки в SQLite. Installer загружается в `QSaveFile`, одновременно
+хешируется и публикуется по конечному пути только при совпадении SHA-256 с digest
+asset из GitHub API. Запуск требует отдельного подтверждения пользователя.
 
-Тег `vX.Y.Z` запускает Windows workflow с тестами и PyInstaller. Workflow
-проверяет совпадение тега, версии пакета и `winsshui.__version__`, затем прикладывает
-к релизу `WinSSH-UI.exe` и SHA-256 checksum.
+Тег `vX.Y.Z` запускает Windows workflow с тестами, двумя PyInstaller-сборками и
+Inno Setup. Workflow проверяет совпадение тега, версии пакета и
+`winsshui.__version__`, затем прикладывает installer, portable EXE, askpass helper
+и SHA-256 checksums. PR и push в `main` дополнительно проверяются отдельным CI.
 
 ## Следующие этапы
 
-1. Подписанный установщик и цифровая подпись EXE.
+1. Цифровая подпись EXE и установщика Authenticode.
 2. Установка публичного ключа на сервер и проверка `authorized_keys`.
 3. Системный трей и глобальная строка быстрого запуска.

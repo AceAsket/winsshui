@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import logging
+from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -36,6 +38,70 @@ from winsshui.catalog import ConnectionCatalog
 from winsshui.models import CommandSnippet, ConnectionItem, TerminalLaunchMode, WorkspaceItem
 from winsshui.ssh_keys import SshKeyInfo, SshKeyManager
 from winsshui.ssh_writer import SshConnectionDraft
+from winsshui.logging_utils import export_diagnostics
+
+
+class ApplicationLogDialog(QDialog):
+    def __init__(self, log_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.log_path = log_path.resolve()
+        self.setWindowTitle("Журнал и диагностика")
+        self.resize(820, 560)
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Журнал содержит технические события приложения. Пароли фильтруются; "
+            "SSH-конфигурация и приватные ключи не включаются. Журнал может содержать "
+            "алиасы и адреса — просмотрите его перед передачей третьим лицам."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(self.text, 1)
+        actions = QHBoxLayout()
+        refresh = QPushButton("Обновить")
+        refresh.clicked.connect(self.reload)
+        open_folder = QPushButton("Открыть папку")
+        open_folder.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_path.parent)))
+        )
+        export = QPushButton("Экспорт диагностики…")
+        export.clicked.connect(self._export)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(self.accept)
+        actions.addWidget(refresh)
+        actions.addWidget(open_folder)
+        actions.addWidget(export)
+        actions.addStretch()
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        self.reload()
+
+    def reload(self) -> None:
+        try:
+            content = self.log_path.read_text(encoding="utf-8", errors="replace")
+            self.text.setPlainText(content[-500_000:])
+            self.text.moveCursor(QTextCursor.MoveOperation.End)
+        except OSError as exception:
+            self.text.setPlainText(f"Журнал пока недоступен: {exception}")
+
+    def _export(self) -> None:
+        default_name = f"winsshui-diagnostics-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        filename, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт диагностики",
+            str(Path.home() / default_name),
+            "Диагностика WinSSH UI (*.zip)",
+        )
+        if not filename:
+            return
+        try:
+            destination = export_diagnostics(self.log_path, Path(filename))
+            QMessageBox.information(self, "Диагностика", f"Архив сохранён:\n{destination}")
+        except OSError as exception:
+            logging.getLogger(__name__).exception("Diagnostic export failed")
+            QMessageBox.warning(self, "Диагностика", str(exception))
 
 
 class NewConnectionDialog(QDialog):
@@ -55,7 +121,8 @@ class NewConnectionDialog(QDialog):
         layout = QVBoxLayout(self)
         description = QLabel(
             "Подключение будет сохранено отдельным блоком Host в выбранном файле настроек SSH. "
-            "Пароли приложение не хранит."
+            "Пароли не записываются в SSH config; при необходимости их можно отдельно сохранить "
+            "в Windows Credential Manager."
         )
         description.setWordWrap(True)
         layout.addWidget(description)

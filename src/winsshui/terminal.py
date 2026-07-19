@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -34,7 +35,16 @@ def detect_tools() -> ExternalToolsStatus:
     return ExternalToolsStatus(shutil.which("wt.exe"), shutil.which("ssh.exe"))
 
 
+def detect_askpass_helper() -> str | None:
+    candidates = [Path(sys.executable).with_name("WinSSH-AskPass.exe")]
+    candidates.append(Path(__file__).resolve().parents[2] / "dist" / "WinSSH-AskPass.exe")
+    return str(next((path for path in candidates if path.is_file()), "")) or None
+
+
 class WindowsTerminalLauncher:
+    def __init__(self, askpass_path: str | None = None) -> None:
+        self.askpass_path = askpass_path or detect_askpass_helper()
+
     def create_command(
         self,
         host: SshHost,
@@ -48,11 +58,17 @@ class WindowsTerminalLauncher:
         command.extend(["--title", host.alias, "ssh.exe", host.alias])
         return command
 
-    def launch(self, host: SshHost, mode: TerminalLaunchMode) -> subprocess.Popen[bytes]:
+    def launch(
+        self,
+        host: SshHost,
+        mode: TerminalLaunchMode,
+        credential_alias: str | None = None,
+    ) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
-            self.create_command(host, mode),
+            self._credential_command(self.create_command(host, mode), credential_alias),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             close_fds=True,
+            env=self._credential_environment(credential_alias),
         )
 
     def create_snippet_command(
@@ -84,12 +100,38 @@ class WindowsTerminalLauncher:
         host: SshHost,
         remote_command: str,
         title: str | None = None,
+        credential_alias: str | None = None,
     ) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
-            self.create_snippet_command(host, remote_command, title),
+            self._credential_command(
+                self.create_snippet_command(host, remote_command, title), credential_alias
+            ),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             close_fds=True,
+            env=self._credential_environment(credential_alias),
         )
+
+    def _credential_command(self, command: list[str], alias: str | None) -> list[str]:
+        if not alias or not self.askpass_path:
+            return command
+        ssh_index = next((index for index, item in enumerate(command) if item.casefold() == "ssh.exe"), -1)
+        if ssh_index >= 0:
+            command = list(command)
+            command[ssh_index + 1:ssh_index + 1] = ["-o", "NumberOfPasswordPrompts=1"]
+        return command
+
+    def _credential_environment(self, alias: str | None) -> dict[str, str] | None:
+        if not alias or not self.askpass_path:
+            return None
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "SSH_ASKPASS": self.askpass_path,
+                "SSH_ASKPASS_REQUIRE": "force",
+                "WINSSHUI_CREDENTIAL_ALIAS": alias,
+            }
+        )
+        return environment
 
     def create_workspace_command(
         self,
