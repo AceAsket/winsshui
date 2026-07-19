@@ -45,6 +45,9 @@ class SftpBrowserDialog(QDialog):
         self.open_winscp = open_winscp
         self._process: QProcess | None = None
         self._operation = ""
+        self._fallback_command: TransferCommand | None = None
+        self._legacy_mode = False
+        self._using_legacy = False
         self.setWindowTitle(f"SFTP и SCP — {alias}")
         self.resize(880, 620)
         layout = QVBoxLayout(self)
@@ -98,18 +101,37 @@ class SftpBrowserDialog(QDialog):
 
     def refresh(self) -> None:
         try:
-            command = self.manager.list_command(self.alias, self.path_edit.text())
+            fallback = None
+            if self._legacy_mode or not self.manager.sftp_path:
+                self._legacy_mode = True
+                command = self.manager.fallback_list_command(self.alias, self.path_edit.text())
+            else:
+                command = self.manager.list_command(self.alias, self.path_edit.text())
+                try:
+                    fallback = self.manager.fallback_list_command(
+                        self.alias, self.path_edit.text()
+                    )
+                except FileNotFoundError:
+                    pass
         except (OSError, ValueError) as exception:
             QMessageBox.warning(self, "SFTP", str(exception))
             return
-        self._run(command, "list")
+        self._run(command, "list", fallback, self._legacy_mode)
 
-    def _run(self, command: TransferCommand, operation: str) -> None:
+    def _run(
+        self,
+        command: TransferCommand,
+        operation: str,
+        fallback: TransferCommand | None = None,
+        using_legacy: bool = False,
+    ) -> None:
         if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
             return
         process = QProcess(self)
         self._process = process
         self._operation = operation
+        self._fallback_command = fallback
+        self._using_legacy = using_legacy
         process.setProgram(command.program)
         process.setArguments(list(command.arguments))
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -125,7 +147,8 @@ class SftpBrowserDialog(QDialog):
             else None
         )
         process.finished.connect(lambda code, _status: self._finished(process, code))
-        self.log.setPlainText(f"{operation}: выполняется…")
+        protocol = "SSH / классический SCP" if using_legacy else "SFTP / SCP"
+        self.log.setPlainText(f"{operation}: выполняется через {protocol}…")
         process.start()
 
     def _finished(self, process: QProcess, exit_code: int) -> None:
@@ -133,9 +156,16 @@ class SftpBrowserDialog(QDialog):
             return
         output = bytes(process.readAll()).decode("utf-8", errors="replace").strip()
         operation = self._operation
+        fallback = self._fallback_command
+        used_legacy = self._using_legacy
         self._process = None
+        self._fallback_command = None
         process.deleteLater()
         if exit_code != 0:
+            if fallback and self.manager.needs_legacy_fallback(output):
+                self._legacy_mode = True
+                self._run(fallback, operation, using_legacy=True)
+                return
             self.log.setPlainText(output or f"Процесс завершился с кодом {exit_code}")
             return
         if operation == "list":
@@ -144,9 +174,11 @@ class SftpBrowserDialog(QDialog):
             self.path_edit.setText(normalized)
             if self.save_path:
                 self.save_path(normalized)
-            self.log.setPlainText(f"SFTP: показано объектов: {self.table.rowCount()}")
+            protocol = "SSH (SFTP на сервере отсутствует)" if used_legacy else "SFTP"
+            self.log.setPlainText(f"{protocol}: показано объектов: {self.table.rowCount()}")
         else:
-            self.log.setPlainText(output or "Передача завершена успешно")
+            protocol = "классический SCP" if used_legacy else "SCP"
+            self.log.setPlainText(output or f"Передача через {protocol} завершена успешно")
             self.refresh()
 
     def _show_entries(self, entries: tuple[RemoteEntry, ...]) -> None:
@@ -177,12 +209,24 @@ class SftpBrowserDialog(QDialog):
     def _upload_file(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(self, "Файл для загрузки")
         if selected:
-            self._run(self.manager.upload_command(self.alias, Path(selected), self.path_edit.text()), "upload")
+            primary = self.manager.upload_command(
+                self.alias, Path(selected), self.path_edit.text(), legacy=self._legacy_mode
+            )
+            fallback = None if self._legacy_mode else self.manager.upload_command(
+                self.alias, Path(selected), self.path_edit.text(), legacy=True
+            )
+            self._run(primary, "upload", fallback, self._legacy_mode)
 
     def _upload_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Папка для загрузки")
         if selected:
-            self._run(self.manager.upload_command(self.alias, Path(selected), self.path_edit.text(), True), "upload")
+            primary = self.manager.upload_command(
+                self.alias, Path(selected), self.path_edit.text(), True, self._legacy_mode
+            )
+            fallback = None if self._legacy_mode else self.manager.upload_command(
+                self.alias, Path(selected), self.path_edit.text(), True, True
+            )
+            self._run(primary, "upload", fallback, self._legacy_mode)
 
     def _download(self) -> None:
         entry = self._selected()
@@ -191,7 +235,13 @@ class SftpBrowserDialog(QDialog):
         selected = QFileDialog.getExistingDirectory(self, "Куда скачать")
         if selected:
             remote = self.manager.join_remote_path(self.path_edit.text(), entry.name)
-            self._run(self.manager.download_command(self.alias, remote, Path(selected), entry.is_directory), "download")
+            primary = self.manager.download_command(
+                self.alias, remote, Path(selected), entry.is_directory, self._legacy_mode
+            )
+            fallback = None if self._legacy_mode else self.manager.download_command(
+                self.alias, remote, Path(selected), entry.is_directory, True
+            )
+            self._run(primary, "download", fallback, self._legacy_mode)
 
     def _copy_path(self) -> None:
         entry = self._selected()

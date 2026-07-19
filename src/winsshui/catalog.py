@@ -23,6 +23,7 @@ from winsshui.models import (
 
 class ConnectionCatalog:
     history_limit = 100
+    session_limit = 30
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path.resolve()
@@ -401,6 +402,37 @@ class ConnectionCatalog:
                 """,
                 (self.history_limit,),
             )
+            row = connection.execute(
+                "SELECT value FROM app_settings WHERE key = 'session.current'"
+            ).fetchone()
+            session = self._decode_session(None if row is None else row["value"])
+            session = [entry for entry in session if entry[0].casefold() != alias.casefold()]
+            session.append((alias, mode))
+            connection.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('session.current', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (self._encode_session(session[-self.session_limit :]),),
+            )
+
+    def begin_session(self) -> tuple[tuple[str, TerminalLaunchMode], ...]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM app_settings WHERE key = 'session.current'"
+            ).fetchone()
+            previous = self._decode_session(None if row is None else row["value"])
+            connection.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('session.previous', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (self._encode_session(previous),),
+            )
+            connection.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('session.current', '[]') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+        return tuple(previous)
+
+    def get_previous_session(self) -> tuple[tuple[str, TerminalLaunchMode], ...]:
+        return self._get_session_setting("session.previous")
 
     def get_recent(self, limit: int = 10) -> list[HistoryEntry]:
         if not 1 <= limit <= self.history_limit:
@@ -605,6 +637,47 @@ class ConnectionCatalog:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (normalized, value),
             )
+
+    def _get_session_setting(
+        self, key: str
+    ) -> tuple[tuple[str, TerminalLaunchMode], ...]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM app_settings WHERE key = ?", (key,)
+            ).fetchone()
+        return tuple(self._decode_session(None if row is None else row["value"]))
+
+    @staticmethod
+    def _encode_session(entries: list[tuple[str, TerminalLaunchMode]]) -> str:
+        return json.dumps(
+            [{"alias": alias, "mode": mode.value} for alias, mode in entries],
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _decode_session(value: str | None) -> list[tuple[str, TerminalLaunchMode]]:
+        if not value:
+            return []
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(decoded, list):
+            return []
+        result: list[tuple[str, TerminalLaunchMode]] = []
+        for item in decoded:
+            if not isinstance(item, dict):
+                continue
+            alias = item.get("alias")
+            mode = item.get("mode")
+            if not isinstance(alias, str) or not alias.strip():
+                continue
+            try:
+                launch_mode = TerminalLaunchMode(mode)
+            except (TypeError, ValueError):
+                launch_mode = TerminalLaunchMode.NEW_TAB
+            result.append((alias.strip(), launch_mode))
+        return result
 
     @staticmethod
     def _normalize_notes(notes: str | None) -> str | None:

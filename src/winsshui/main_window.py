@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QIODevice, QPoint, QProcess, QSaveFile, QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon, QKeySequence, QShortcut
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -141,6 +142,7 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._force_quit = False
         self._tray_hint_shown = False
+        self._previous_session: tuple[tuple[str, TerminalLaunchMode], ...] = ()
         self.tray_icon: QSystemTrayIcon | None = None
         try:
             self.credential_store: WindowsCredentialStore | None = WindowsCredentialStore()
@@ -162,8 +164,10 @@ class MainWindow(QMainWindow):
 
         try:
             self.catalog.initialize()
+            self._previous_session = self.catalog.begin_session()
             self.reload_connections()
             self._setup_tray()
+            QTimer.singleShot(900, self._offer_restore_previous_session)
             QTimer.singleShot(1800, self._start_configured_tunnels)
             QTimer.singleShot(1500, self._auto_check_updates)
         except Exception as exception:
@@ -207,8 +211,15 @@ class MainWindow(QMainWindow):
         self.ssh_tools_button = QPushButton("SSH-инструменты")
         self.ssh_tools_button.clicked.connect(self._show_ssh_tools_menu)
         header.addWidget(self.ssh_tools_button)
-        self.data_button = QPushButton("Данные")
-        self.data_button.setToolTip(f"WinSSH UI {__version__}: резервные копии и обновления")
+        self.data_button = QPushButton()
+        self.data_button.setObjectName("iconButton")
+        self.data_button.setFixedWidth(42)
+        self.data_button.setIcon(QIcon(str(resource_path("assets/ui/settings.svg"))))
+        self.data_button.setIconSize(QSize(20, 20))
+        self.data_button.setAccessibleName("Данные и настройки")
+        self.data_button.setToolTip(
+            f"Данные и настройки · WinSSH UI {__version__}: сеансы, резервные копии и обновления"
+        )
         self.data_button.clicked.connect(self._show_data_menu)
         header.addWidget(self.data_button)
         self.refresh_button = QPushButton("↻")
@@ -1823,8 +1834,104 @@ class MainWindow(QMainWindow):
         self.close()
         QApplication.quit()
 
+    def _restorable_previous_session(
+        self,
+    ) -> list[tuple[ConnectionItem, TerminalLaunchMode]]:
+        if not self.tools.can_connect:
+            return []
+        by_alias = {connection.alias.casefold(): connection for connection in self.connections}
+        return [
+            (connection, mode)
+            for alias, mode in self._previous_session
+            if (connection := by_alias.get(alias.casefold())) is not None
+        ]
+
+    def _offer_restore_previous_session(self) -> None:
+        try:
+            if self.catalog.get_setting("session.offer_restore") == "0":
+                return
+        except sqlite3.Error:
+            return
+        entries = self._restorable_previous_session()
+        if not entries or self._closing:
+            return
+        aliases = [connection.alias for connection, _mode in entries]
+        preview = "\n".join(f"• {alias}" for alias in aliases[:10])
+        if len(aliases) > 10:
+            preview += f"\n• …и ещё {len(aliases) - 10}"
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Предыдущий SSH-сеанс")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText(f"Восстановить подключений: {len(entries)}?")
+        dialog.setInformativeText(
+            "Они будут повторно открыты в окне Windows Terminal.\n\n" + preview
+        )
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        dialog.button(QMessageBox.StandardButton.Yes).setText("Восстановить")
+        dialog.button(QMessageBox.StandardButton.No).setText("Не сейчас")
+        dialog.setDefaultButton(QMessageBox.StandardButton.Yes)
+        dont_ask = QCheckBox("Больше не предлагать автоматически")
+        dialog.setCheckBox(dont_ask)
+        answer = dialog.exec()
+        if dont_ask.isChecked():
+            try:
+                self.catalog.save_setting("session.offer_restore", "0")
+            except sqlite3.Error:
+                pass
+        if answer == QMessageBox.StandardButton.Yes:
+            self._restore_previous_session()
+
+    def _restore_previous_session(self, _checked: bool = False) -> None:
+        entries = self._restorable_previous_session()
+        if not entries:
+            return
+        restored: list[str] = []
+        failed: list[tuple[str, TerminalLaunchMode]] = []
+        error_messages: list[str] = []
+        for index, (connection, saved_mode) in enumerate(entries):
+            mode = TerminalLaunchMode.NEW_TAB if index == 0 else saved_mode
+            try:
+                self.terminal_launcher.launch(
+                    connection.host,
+                    mode,
+                    self._credential_alias_for(connection),
+                )
+                self.catalog.record_launch(connection.alias, mode)
+                restored.append(connection.alias)
+            except (OSError, ValueError, sqlite3.Error) as exception:
+                failed.append((connection.alias, saved_mode))
+                error_messages.append(f"{connection.alias}: {exception}")
+        self._previous_session = tuple(failed)
+        self._reload_history()
+        if restored:
+            self.status_label.setText(
+                f"Восстановлен предыдущий сеанс: подключений {len(restored)}"
+            )
+        if error_messages:
+            QMessageBox.warning(
+                self,
+                "Сеанс восстановлен частично",
+                "Не удалось открыть:\n" + "\n".join(error_messages),
+            )
+
     def _show_data_menu(self) -> None:
         menu = QMenu(self)
+        restore_session = menu.addAction("Восстановить предыдущий сеанс…")
+        restore_session.setEnabled(bool(self._restorable_previous_session()))
+        restore_session.triggered.connect(self._restore_previous_session)
+        offer_restore = menu.addAction("Предлагать восстановление при запуске")
+        offer_restore.setCheckable(True)
+        offer_restore.setChecked(
+            self.catalog.get_setting("session.offer_restore") != "0"
+        )
+        offer_restore.toggled.connect(
+            lambda enabled: self.catalog.save_setting(
+                "session.offer_restore", "1" if enabled else "0"
+            )
+        )
+        menu.addSeparator()
         update_action = menu.addAction(f"Проверить обновления…  (версия {__version__})")
         update_action.triggered.connect(lambda: self._check_updates(silent=False))
         log_action = menu.addAction("Журнал и диагностика…")

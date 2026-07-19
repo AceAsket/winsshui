@@ -138,6 +138,25 @@ class ConnectionCatalogTests(unittest.TestCase):
                 catalog.get_setting("updates.last_checked_utc"),
             )
 
+    def test_previous_session_is_deduplicated_and_rotated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = ConnectionCatalog(Path(directory) / "catalog.db")
+            catalog.initialize()
+            self.assertEqual((), catalog.begin_session())
+            catalog.record_launch("router", TerminalLaunchMode.NEW_TAB)
+            catalog.record_launch("server", TerminalLaunchMode.SPLIT_RIGHT)
+            catalog.record_launch("router", TerminalLaunchMode.SPLIT_RIGHT)
+            previous = catalog.begin_session()
+            self.assertEqual(
+                (
+                    ("server", TerminalLaunchMode.SPLIT_RIGHT),
+                    ("router", TerminalLaunchMode.SPLIT_RIGHT),
+                ),
+                previous,
+            )
+            self.assertEqual(previous, catalog.get_previous_session())
+            self.assertEqual((), catalog.begin_session())
+
     def test_tunnel_preferences_follow_alias_and_are_deleted(self) -> None:
         with tempfile.TemporaryDirectory(prefix="winsshui-tests-") as directory:
             catalog = ConnectionCatalog(Path(directory) / "catalog.db")
