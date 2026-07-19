@@ -7,7 +7,7 @@ from winsshui.transfers import OpenSshTransferManager
 
 class TransferManagerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.manager = OpenSshTransferManager("sftp.exe", "scp.exe")
+        self.manager = OpenSshTransferManager("sftp.exe", "scp.exe", "ssh.exe")
 
     def test_sftp_listing_uses_stdin_and_strict_host_checking(self) -> None:
         command = self.manager.list_command("prod", "/var/www")
@@ -36,9 +36,33 @@ class TransferManagerTests(unittest.TestCase):
         self.assertIn("prod:/tmp", upload.arguments)
         self.assertIn("prod:/tmp/a file.txt", download.arguments)
 
+    def test_embedded_server_falls_back_to_ssh_and_legacy_scp(self) -> None:
+        listing = self.manager.fallback_list_command("router", "/tmp/a'b")
+        self.assertEqual("ssh.exe", listing.program)
+        self.assertIn("LC_ALL=C ls -la", listing.arguments[-1])
+        self.assertIn("'\"'\"'", listing.arguments[-1])
+        self.assertTrue(
+            self.manager.needs_legacy_fallback(
+                "ash: /usr/libexec/sftp-server: not found\nConnection closed"
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "a file.txt"
+            source.write_text("test", encoding="utf-8")
+            upload = self.manager.upload_command("router", source, "/tmp/a b", legacy=True)
+            download = self.manager.download_command(
+                "router", "/tmp/a b", Path(directory), legacy=True
+            )
+        self.assertIn("-O", upload.arguments)
+        self.assertIn("router:'/tmp/a b'", upload.arguments)
+        self.assertIn("-O", download.arguments)
+
     def test_rejects_newlines_in_remote_path(self) -> None:
         with self.assertRaises(ValueError):
             self.manager.list_command("prod", "/tmp\nput bad")
+
+    def test_neutralizes_option_like_remote_path(self) -> None:
+        self.assertEqual("./-rf", self.manager.normalize_remote_path("-rf"))
 
 
 if __name__ == "__main__":

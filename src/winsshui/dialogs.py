@@ -1118,7 +1118,8 @@ class WorkspaceDialog(QDialog):
         self.launch_window_name = "winsshui"
         self.workspaces = self.catalog.get_workspaces()
         self.setWindowTitle("Рабочие пространства")
-        self.resize(720, 580)
+        self.resize(940, 620)
+        self.setMinimumSize(840, 520)
 
         layout = QVBoxLayout(self)
         selector_row = QHBoxLayout()
@@ -1147,10 +1148,24 @@ class WorkspaceDialog(QDialog):
 
         self.table = QTableWidget(len(connections), 7)
         self.table.setHorizontalHeaderLabels(
-            ["Открыть", "Подключение", "Расположение", "Направление", "Размер, %", "Заголовок", "Цвет"]
+            ["Открыть", "Подключение", "Режим", "Разделение", "Размер, %", "Заголовок", "Цвет"]
         )
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, header.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, header.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, header.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, header.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, header.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, header.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, header.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 84)
+        self.table.setColumnWidth(2, 145)
+        self.table.setColumnWidth(3, 125)
+        self.table.setColumnWidth(4, 90)
+        self.table.setColumnWidth(6, 105)
         for row, connection in enumerate(connections):
             selected = QTableWidgetItem()
             selected.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
@@ -1159,8 +1174,11 @@ class WorkspaceDialog(QDialog):
             alias_item = QTableWidgetItem(connection.alias)
             alias_item.setFlags(alias_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             mode_combo = QComboBox()
-            mode_combo.addItem("Новая вкладка", TerminalLaunchMode.NEW_TAB)
-            mode_combo.addItem("Панель справа", TerminalLaunchMode.SPLIT_RIGHT)
+            mode_combo.addItem("Вкладка", TerminalLaunchMode.NEW_TAB)
+            mode_combo.addItem("Split", TerminalLaunchMode.SPLIT_RIGHT)
+            mode_combo.setToolTip(
+                "Вкладка — открыть отдельную вкладку; Split — разделить текущую вкладку"
+            )
             direction_combo = QComboBox()
             direction_combo.addItem("Справа", PaneDirection.VERTICAL)
             direction_combo.addItem("Снизу", PaneDirection.HORIZONTAL)
