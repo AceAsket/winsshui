@@ -42,7 +42,14 @@ class SshKeyManagerTests(unittest.TestCase):
             ):
                 keys = manager.list_keys()
             self.assertEqual(
-                SshKeyInfo("id_ed25519", private, root / "id_ed25519.pub", "ED25519", "SHA256:test", True),
+                SshKeyInfo(
+                    "id_ed25519",
+                    manager.ssh_directory / "id_ed25519",
+                    manager.ssh_directory / "id_ed25519.pub",
+                    "ED25519",
+                    "SHA256:test",
+                    True,
+                ),
                 keys[0],
             )
 
