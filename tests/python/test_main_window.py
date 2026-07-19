@@ -28,7 +28,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window = MainWindow(root / "data")
             try:
                 self.assertEqual("WinSSH UI", window.windowTitle())
-                self.assertEqual("WinSSH UI 0.5.0", window.version_label.text())
+                self.assertEqual("WinSSH UI 0.6.0", window.version_label.text())
                 self.assertEqual(0, window.connection_list.topLevelItemCount())
                 self.assertFalse(window.connect_button.isEnabled())
                 self.assertFalse(window.host_key_button.isEnabled())
@@ -157,6 +157,21 @@ class MainWindowSmokeTests(unittest.TestCase):
                     window._sync_imports()
                 adopted = window.catalog.get_all_metadata()["imported"]
                 self.assertEqual("WinSCP", adopted.origin_type)
+                window.catalog.save_metadata(
+                    ConnectionMetadata(
+                        **{
+                            field: getattr(adopted, field)
+                            for field in adopted.__dataclass_fields__
+                            if field not in ("notes", "tags")
+                        },
+                        notes="Production jump host",
+                        tags=("linux", "critical"),
+                    )
+                )
+                window.reload_connections()
+                window.search_edit.setText("critical")
+                self.assertIsNotNone(window._selected_connection())
+                window.search_edit.clear()
 
                 new_candidate = ImportCandidate("WinSCP", "imported", "new.example.test", "deploy")
                 with (
@@ -175,6 +190,9 @@ class MainWindowSmokeTests(unittest.TestCase):
                     "new.example.test",
                     window.config_reader.read(ssh_directory / "config")[0].hostname,
                 )
+                synchronized = window.catalog.get_all_metadata()["imported"]
+                self.assertEqual("Production jump host", synchronized.notes)
+                self.assertEqual(("linux", "critical"), synchronized.tags)
             finally:
                 window.close()
 

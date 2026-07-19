@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -12,6 +13,7 @@ from winsshui.models import (
     CommandSnippet,
     HistoryEntry,
     TerminalLaunchMode,
+    TunnelPreferences,
     Workspace,
     WorkspaceItem,
 )
@@ -42,7 +44,9 @@ class ConnectionCatalog:
                         source_fingerprint TEXT NULL,
                         imported_at_utc TEXT NULL,
                         last_synced_at_utc TEXT NULL,
-                        icon_name TEXT NULL
+                        icon_name TEXT NULL,
+                        notes TEXT NULL,
+                        tags TEXT NULL
                     );
 
                     CREATE TABLE IF NOT EXISTS connection_history (
@@ -88,6 +92,12 @@ class ConnectionCatalog:
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS tunnel_preferences (
+                        alias TEXT PRIMARY KEY COLLATE NOCASE,
+                        auto_restart INTEGER NOT NULL DEFAULT 0,
+                        start_with_app INTEGER NOT NULL DEFAULT 0
+                    );
                     """
                 )
                 columns = {
@@ -101,6 +111,8 @@ class ConnectionCatalog:
                     "imported_at_utc",
                     "last_synced_at_utc",
                     "icon_name",
+                    "notes",
+                    "tags",
                 ):
                     if name not in columns:
                         connection.execute(f"ALTER TABLE connection_metadata ADD COLUMN {name} TEXT NULL")
@@ -117,7 +129,8 @@ class ConnectionCatalog:
             rows = connection.execute(
                 """
                 SELECT alias, is_favorite, group_name, origin_type, origin_identifier,
-                       source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name
+                       source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name,
+                       notes, tags
                 FROM connection_metadata
                 """
             ).fetchall()
@@ -132,6 +145,8 @@ class ConnectionCatalog:
                 row["imported_at_utc"],
                 row["last_synced_at_utc"],
                 row["icon_name"],
+                row["notes"],
+                self._decode_tags(row["tags"]),
             )
             for row in rows
         }
@@ -143,9 +158,10 @@ class ConnectionCatalog:
                 """
                 INSERT INTO connection_metadata(
                     alias, is_favorite, group_name, origin_type, origin_identifier,
-                    source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name
+                    source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name,
+                    notes, tags
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(alias) DO UPDATE SET
                     is_favorite = excluded.is_favorite,
                     group_name = excluded.group_name,
@@ -154,7 +170,9 @@ class ConnectionCatalog:
                     source_fingerprint = excluded.source_fingerprint,
                     imported_at_utc = excluded.imported_at_utc,
                     last_synced_at_utc = excluded.last_synced_at_utc,
-                    icon_name = excluded.icon_name
+                    icon_name = excluded.icon_name,
+                    notes = excluded.notes,
+                    tags = excluded.tags
                 """,
                 (
                     metadata.alias,
@@ -166,6 +184,8 @@ class ConnectionCatalog:
                     metadata.imported_at_utc,
                     metadata.last_synced_at_utc,
                     metadata.icon_name,
+                    self._normalize_notes(metadata.notes),
+                    self._encode_tags(metadata.tags),
                 ),
             )
 
@@ -180,9 +200,10 @@ class ConnectionCatalog:
                 """
                 INSERT INTO connection_metadata(
                     alias, is_favorite, group_name, origin_type, origin_identifier,
-                    source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name
+                    source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name,
+                    notes, tags
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(alias) DO UPDATE SET
                     is_favorite = excluded.is_favorite,
                     group_name = excluded.group_name,
@@ -191,7 +212,9 @@ class ConnectionCatalog:
                     source_fingerprint = excluded.source_fingerprint,
                     imported_at_utc = excluded.imported_at_utc,
                     last_synced_at_utc = excluded.last_synced_at_utc,
-                    icon_name = excluded.icon_name
+                    icon_name = excluded.icon_name,
+                    notes = excluded.notes,
+                    tags = excluded.tags
                 """,
                 (
                     metadata.alias,
@@ -203,6 +226,8 @@ class ConnectionCatalog:
                     metadata.imported_at_utc,
                     metadata.last_synced_at_utc,
                     metadata.icon_name,
+                    self._normalize_notes(metadata.notes),
+                    self._encode_tags(metadata.tags),
                 ),
             )
             if original_alias.casefold() != metadata.alias.casefold():
@@ -212,6 +237,10 @@ class ConnectionCatalog:
                 )
                 connection.execute(
                     "UPDATE command_snippets SET alias = ? WHERE alias = ? COLLATE NOCASE",
+                    (metadata.alias, original_alias),
+                )
+                connection.execute(
+                    "UPDATE tunnel_preferences SET alias = ? WHERE alias = ? COLLATE NOCASE",
                     (metadata.alias, original_alias),
                 )
 
@@ -224,6 +253,35 @@ class ConnectionCatalog:
             connection.execute(
                 "DELETE FROM command_snippets WHERE alias = ? COLLATE NOCASE",
                 (alias,),
+            )
+            connection.execute(
+                "DELETE FROM tunnel_preferences WHERE alias = ? COLLATE NOCASE",
+                (alias,),
+            )
+
+    def get_tunnel_preferences(self) -> dict[str, TunnelPreferences]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT alias, auto_restart, start_with_app FROM tunnel_preferences"
+            ).fetchall()
+        return {
+            row["alias"].casefold(): TunnelPreferences(
+                row["alias"], bool(row["auto_restart"]), bool(row["start_with_app"])
+            )
+            for row in rows
+        }
+
+    def save_tunnel_preferences(self, preferences: TunnelPreferences) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO tunnel_preferences(alias, auto_restart, start_with_app)
+                VALUES (?, ?, ?)
+                ON CONFLICT(alias) DO UPDATE SET
+                    auto_restart = excluded.auto_restart,
+                    start_with_app = excluded.start_with_app
+                """,
+                (preferences.alias, preferences.auto_restart, preferences.start_with_app),
             )
 
     def record_launch(
@@ -422,6 +480,35 @@ class ConnectionCatalog:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (normalized, value),
             )
+
+    @staticmethod
+    def _normalize_notes(notes: str | None) -> str | None:
+        normalized = notes.strip() if notes else ""
+        return normalized or None
+
+    @staticmethod
+    def _encode_tags(tags: tuple[str, ...]) -> str | None:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            value = tag.strip()
+            key = value.casefold()
+            if value and key not in seen:
+                seen.add(key)
+                normalized.append(value)
+        return json.dumps(normalized, ensure_ascii=False) if normalized else None
+
+    @staticmethod
+    def _decode_tags(value: str | None) -> tuple[str, ...]:
+        if not value:
+            return ()
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        if not isinstance(decoded, list):
+            return ()
+        return tuple(str(tag).strip() for tag in decoded if str(tag).strip())
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

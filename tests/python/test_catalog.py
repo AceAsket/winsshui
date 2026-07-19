@@ -5,7 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from winsshui.catalog import ConnectionCatalog
-from winsshui.models import ConnectionMetadata, TerminalLaunchMode, WorkspaceItem
+from winsshui.models import (
+    ConnectionMetadata,
+    TerminalLaunchMode,
+    TunnelPreferences,
+    WorkspaceItem,
+)
 
 
 class ConnectionCatalogTests(unittest.TestCase):
@@ -14,7 +19,14 @@ class ConnectionCatalogTests(unittest.TestCase):
             catalog = ConnectionCatalog(Path(directory) / "catalog.db")
             catalog.initialize()
             catalog.save_metadata(
-                ConnectionMetadata("prod", True, "Production", icon_name="database")
+                ConnectionMetadata(
+                    "prod",
+                    True,
+                    "Production",
+                    icon_name="database",
+                    notes="Primary database",
+                    tags=("Linux", "Production"),
+                )
             )
             catalog.record_launch(
                 "prod",
@@ -26,6 +38,8 @@ class ConnectionCatalogTests(unittest.TestCase):
             self.assertTrue(metadata.is_favorite)
             self.assertEqual("Production", metadata.group_name)
             self.assertEqual("database", metadata.icon_name)
+            self.assertEqual("Primary database", metadata.notes)
+            self.assertEqual(("Linux", "Production"), metadata.tags)
             self.assertEqual("prod", history[0].alias)
             self.assertEqual("SplitRight", history[0].mode)
 
@@ -114,6 +128,21 @@ class ConnectionCatalogTests(unittest.TestCase):
                 "2026-07-19T10:00:00+00:00",
                 catalog.get_setting("updates.last_checked_utc"),
             )
+
+    def test_tunnel_preferences_follow_alias_and_are_deleted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="winsshui-tests-") as directory:
+            catalog = ConnectionCatalog(Path(directory) / "catalog.db")
+            catalog.initialize()
+            catalog.save_metadata(ConnectionMetadata("gateway"))
+            catalog.save_tunnel_preferences(TunnelPreferences("gateway", True, True))
+            self.assertEqual(
+                TunnelPreferences("gateway", True, True),
+                catalog.get_tunnel_preferences()["gateway"],
+            )
+            catalog.replace_metadata("gateway", ConnectionMetadata("gateway-new"))
+            self.assertIn("gateway-new", catalog.get_tunnel_preferences())
+            catalog.delete_metadata("gateway-new")
+            self.assertEqual({}, catalog.get_tunnel_preferences())
 
     def test_initialization_migrates_pre_02_catalog(self) -> None:
         with tempfile.TemporaryDirectory(prefix="winsshui-tests-") as directory:
