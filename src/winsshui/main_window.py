@@ -217,7 +217,11 @@ class MainWindow(QMainWindow):
         self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.tool_status_label = QLabel(self.tools.message)
         self.tool_status_label.setObjectName("statusBadge")
+        self.version_label = QLabel(f"WinSSH UI {__version__}")
+        self.version_label.setObjectName("versionBadge")
+        self.version_label.setToolTip("Установленная версия приложения")
         footer.addWidget(self.status_label, 1)
+        footer.addWidget(self.version_label)
         footer.addWidget(self.tool_status_label)
         root.addLayout(footer)
 
@@ -473,7 +477,7 @@ class MainWindow(QMainWindow):
             QLabel#sectionTitle { color: #dfe3e8; font-size: 12px; font-weight: 650; }
             QLabel#fieldName { color: #8e96a3; font-size: 11px; }
             QLabel#secondary { color: #8f98a6; font-size: 11px; }
-            QLabel#countBadge, QLabel#statusBadge {
+            QLabel#countBadge, QLabel#statusBadge, QLabel#versionBadge {
                 color: #aeb7c4;
                 background: #2a2e35;
                 border: 1px solid #373c45;
