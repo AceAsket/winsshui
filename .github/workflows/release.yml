@@ -43,13 +43,33 @@ jobs:
           }
 
       - name: Build EXE
-        run: python -m PyInstaller --clean --noconfirm winsshui.spec
+        run: |
+          python -m PyInstaller --clean --noconfirm winsshui.spec
+          python -m PyInstaller --clean --noconfirm winsshui-askpass.spec
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = python -c "from winsshui import __version__; print(__version__)"
+          $compiler = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not (Test-Path $compiler)) { throw "Inno Setup compiler not found" }
+          & $compiler "/DMyAppVersion=$version" installer/winsshui.iss
 
       - name: Create checksum
         shell: pwsh
         run: |
-          $hash = (Get-FileHash dist/WinSSH-UI.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  WinSSH-UI.exe" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          $files = @("WinSSH-UI.exe", "WinSSH-AskPass.exe", "WinSSH-UI-Setup.exe")
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash "dist/$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $file"
+          }
+          $lines | Set-Content -Encoding ascii dist/SHA256SUMS.txt
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
@@ -57,6 +77,8 @@ jobs:
           name: WinSSH-UI-${{ github.ref_name }}
           path: |
             dist/WinSSH-UI.exe
+            dist/WinSSH-AskPass.exe
+            dist/WinSSH-UI-Setup.exe
             dist/SHA256SUMS.txt
 
       - name: Publish GitHub Release
@@ -67,6 +89,8 @@ jobs:
         run: >-
           gh release create "${{ github.ref_name }}"
           "dist/WinSSH-UI.exe#WinSSH-UI.exe"
+          "dist/WinSSH-AskPass.exe#WinSSH-AskPass.exe"
+          "dist/WinSSH-UI-Setup.exe#WinSSH-UI-Setup.exe"
           "dist/SHA256SUMS.txt#SHA256SUMS.txt"
           --verify-tag
           --generate-notes

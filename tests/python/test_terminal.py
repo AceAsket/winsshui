@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from winsshui.models import SshHost, TerminalLaunchMode
 from winsshui.terminal import ManagedTunnelCommand, WindowsTerminalLauncher, WinScpLauncher
@@ -46,6 +47,17 @@ class WindowsTerminalLauncherTests(unittest.TestCase):
         self.assertEqual(2, command.count(";"))
         self.assertIn("split-pane", command)
         self.assertEqual(2, command.count("new-tab"))
+
+    def test_stored_password_uses_askpass_without_secret_in_arguments(self) -> None:
+        launcher = WindowsTerminalLauncher(r"C:\Program Files\WinSSH UI\WinSSH-AskPass.exe")
+        with patch("winsshui.terminal.subprocess.Popen") as popen:
+            launcher.launch(SshHost("prod"), TerminalLaunchMode.NEW_TAB, "prod")
+        arguments = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertIn("NumberOfPasswordPrompts=1", arguments)
+        self.assertEqual("force", environment["SSH_ASKPASS_REQUIRE"])
+        self.assertEqual("prod", environment["WINSSHUI_CREDENTIAL_ALIAS"])
+        self.assertNotIn("test-secret", " ".join(arguments))
 
     def test_builds_winscp_url_without_password(self) -> None:
         command = WinScpLauncher(r"C:\Tools\WinSCP.exe").create_command(
