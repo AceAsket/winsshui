@@ -7,7 +7,14 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from winsshui.models import ConnectionMetadata, HistoryEntry, TerminalLaunchMode
+from winsshui.models import (
+    ConnectionMetadata,
+    CommandSnippet,
+    HistoryEntry,
+    TerminalLaunchMode,
+    Workspace,
+    WorkspaceItem,
+)
 
 
 class ConnectionCatalog:
@@ -29,7 +36,13 @@ class ConnectionCatalog:
                     CREATE TABLE IF NOT EXISTS connection_metadata (
                         alias TEXT PRIMARY KEY COLLATE NOCASE,
                         is_favorite INTEGER NOT NULL DEFAULT 0,
-                        group_name TEXT NULL
+                        group_name TEXT NULL,
+                        origin_type TEXT NULL,
+                        origin_identifier TEXT NULL,
+                        source_fingerprint TEXT NULL,
+                        imported_at_utc TEXT NULL,
+                        last_synced_at_utc TEXT NULL,
+                        icon_name TEXT NULL
                     );
 
                     CREATE TABLE IF NOT EXISTS connection_history (
@@ -41,17 +54,84 @@ class ConnectionCatalog:
 
                     CREATE INDEX IF NOT EXISTS ix_connection_history_launched_at
                         ON connection_history(launched_at_utc DESC);
+
+                    CREATE TABLE IF NOT EXISTS workspaces (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                    );
+
+                    CREATE TABLE IF NOT EXISTS workspace_items (
+                        workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                        position INTEGER NOT NULL,
+                        alias TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        PRIMARY KEY(workspace_id, position)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS command_snippets (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        command TEXT NOT NULL,
+                        alias TEXT NULL COLLATE NOCASE,
+                        UNIQUE(name, alias)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS ix_command_snippets_alias
+                        ON command_snippets(alias);
+
+                    CREATE TABLE IF NOT EXISTS folder_states (
+                        folder_key TEXT PRIMARY KEY,
+                        is_expanded INTEGER NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    """
+                )
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(connection_metadata)").fetchall()
+                }
+                for name in (
+                    "origin_type",
+                    "origin_identifier",
+                    "source_fingerprint",
+                    "imported_at_utc",
+                    "last_synced_at_utc",
+                    "icon_name",
+                ):
+                    if name not in columns:
+                        connection.execute(f"ALTER TABLE connection_metadata ADD COLUMN {name} TEXT NULL")
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_connection_metadata_origin
+                    ON connection_metadata(origin_type COLLATE NOCASE, origin_identifier COLLATE NOCASE)
+                    WHERE origin_type IS NOT NULL AND origin_identifier IS NOT NULL
                     """
                 )
 
     def get_all_metadata(self) -> dict[str, ConnectionMetadata]:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
-                "SELECT alias, is_favorite, group_name FROM connection_metadata"
+                """
+                SELECT alias, is_favorite, group_name, origin_type, origin_identifier,
+                       source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name
+                FROM connection_metadata
+                """
             ).fetchall()
         return {
             row["alias"].casefold(): ConnectionMetadata(
-                row["alias"], bool(row["is_favorite"]), row["group_name"]
+                row["alias"],
+                bool(row["is_favorite"]),
+                row["group_name"],
+                row["origin_type"],
+                row["origin_identifier"],
+                row["source_fingerprint"],
+                row["imported_at_utc"],
+                row["last_synced_at_utc"],
+                row["icon_name"],
             )
             for row in rows
         }
@@ -61,13 +141,89 @@ class ConnectionCatalog:
         with self._lock, self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO connection_metadata(alias, is_favorite, group_name)
-                VALUES (?, ?, ?)
+                INSERT INTO connection_metadata(
+                    alias, is_favorite, group_name, origin_type, origin_identifier,
+                    source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(alias) DO UPDATE SET
                     is_favorite = excluded.is_favorite,
-                    group_name = excluded.group_name
+                    group_name = excluded.group_name,
+                    origin_type = excluded.origin_type,
+                    origin_identifier = excluded.origin_identifier,
+                    source_fingerprint = excluded.source_fingerprint,
+                    imported_at_utc = excluded.imported_at_utc,
+                    last_synced_at_utc = excluded.last_synced_at_utc,
+                    icon_name = excluded.icon_name
                 """,
-                (metadata.alias, metadata.is_favorite, group_name),
+                (
+                    metadata.alias,
+                    metadata.is_favorite,
+                    group_name,
+                    metadata.origin_type,
+                    metadata.origin_identifier,
+                    metadata.source_fingerprint,
+                    metadata.imported_at_utc,
+                    metadata.last_synced_at_utc,
+                    metadata.icon_name,
+                ),
+            )
+
+    def replace_metadata(self, original_alias: str, metadata: ConnectionMetadata) -> None:
+        group_name = metadata.group_name.strip() if metadata.group_name and metadata.group_name.strip() else None
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "DELETE FROM connection_metadata WHERE alias = ? COLLATE NOCASE",
+                (original_alias,),
+            )
+            connection.execute(
+                """
+                INSERT INTO connection_metadata(
+                    alias, is_favorite, group_name, origin_type, origin_identifier,
+                    source_fingerprint, imported_at_utc, last_synced_at_utc, icon_name
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(alias) DO UPDATE SET
+                    is_favorite = excluded.is_favorite,
+                    group_name = excluded.group_name,
+                    origin_type = excluded.origin_type,
+                    origin_identifier = excluded.origin_identifier,
+                    source_fingerprint = excluded.source_fingerprint,
+                    imported_at_utc = excluded.imported_at_utc,
+                    last_synced_at_utc = excluded.last_synced_at_utc,
+                    icon_name = excluded.icon_name
+                """,
+                (
+                    metadata.alias,
+                    metadata.is_favorite,
+                    group_name,
+                    metadata.origin_type,
+                    metadata.origin_identifier,
+                    metadata.source_fingerprint,
+                    metadata.imported_at_utc,
+                    metadata.last_synced_at_utc,
+                    metadata.icon_name,
+                ),
+            )
+            if original_alias.casefold() != metadata.alias.casefold():
+                connection.execute(
+                    "UPDATE connection_history SET alias = ? WHERE alias = ? COLLATE NOCASE",
+                    (metadata.alias, original_alias),
+                )
+                connection.execute(
+                    "UPDATE command_snippets SET alias = ? WHERE alias = ? COLLATE NOCASE",
+                    (metadata.alias, original_alias),
+                )
+
+    def delete_metadata(self, alias: str) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "DELETE FROM connection_metadata WHERE alias = ? COLLATE NOCASE",
+                (alias,),
+            )
+            connection.execute(
+                "DELETE FROM command_snippets WHERE alias = ? COLLATE NOCASE",
+                (alias,),
             )
 
     def record_launch(
@@ -111,6 +267,161 @@ class ConnectionCatalog:
             HistoryEntry(row["id"], row["alias"], datetime.fromisoformat(row["launched_at_utc"]), row["mode"])
             for row in rows
         ]
+
+    def get_workspaces(self) -> list[Workspace]:
+        with self._lock, self._connection() as connection:
+            workspace_rows = connection.execute(
+                "SELECT id, name FROM workspaces ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+            item_rows = connection.execute(
+                """
+                SELECT workspace_id, alias, mode
+                FROM workspace_items
+                ORDER BY workspace_id, position
+                """
+            ).fetchall()
+        items_by_workspace: dict[int, list[WorkspaceItem]] = {}
+        for row in item_rows:
+            try:
+                mode = TerminalLaunchMode(row["mode"])
+            except ValueError:
+                mode = TerminalLaunchMode.NEW_TAB
+            items_by_workspace.setdefault(row["workspace_id"], []).append(
+                WorkspaceItem(row["alias"], mode)
+            )
+        return [
+            Workspace(
+                row["id"],
+                row["name"],
+                tuple(items_by_workspace.get(row["id"], [])),
+            )
+            for row in workspace_rows
+        ]
+
+    def save_workspace(self, name: str, items: tuple[WorkspaceItem, ...]) -> Workspace:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Укажите название рабочего пространства")
+        if not items:
+            raise ValueError("Выберите хотя бы одно подключение")
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO workspaces(name) VALUES (?)
+                ON CONFLICT(name) DO UPDATE SET name = excluded.name
+                """,
+                (normalized_name,),
+            )
+            workspace_id = connection.execute(
+                "SELECT id FROM workspaces WHERE name = ? COLLATE NOCASE",
+                (normalized_name,),
+            ).fetchone()["id"]
+            connection.execute(
+                "DELETE FROM workspace_items WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO workspace_items(workspace_id, position, alias, mode)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (workspace_id, position, item.alias, item.mode.value)
+                    for position, item in enumerate(items)
+                ],
+            )
+        return Workspace(workspace_id, normalized_name, items)
+
+    def delete_workspace(self, workspace_id: int) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute("DELETE FROM workspace_items WHERE workspace_id = ?", (workspace_id,))
+            connection.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+
+    def get_command_snippets(self, alias: str | None = None) -> list[CommandSnippet]:
+        with self._lock, self._connection() as connection:
+            if alias is None:
+                rows = connection.execute(
+                    "SELECT id, name, command, alias FROM command_snippets "
+                    "ORDER BY alias IS NOT NULL, name COLLATE NOCASE"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT id, name, command, alias FROM command_snippets "
+                    "WHERE alias IS NULL OR alias = ? COLLATE NOCASE "
+                    "ORDER BY alias IS NOT NULL, name COLLATE NOCASE",
+                    (alias,),
+                ).fetchall()
+        return [CommandSnippet(row["id"], row["name"], row["command"], row["alias"]) for row in rows]
+
+    def save_command_snippet(
+        self,
+        name: str,
+        command: str,
+        alias: str | None = None,
+        snippet_id: int | None = None,
+    ) -> CommandSnippet:
+        normalized_name = name.strip()
+        normalized_command = command.strip()
+        normalized_alias = alias.strip() if alias and alias.strip() else None
+        if not normalized_name:
+            raise ValueError("Укажите название команды")
+        if not normalized_command:
+            raise ValueError("Введите команду")
+        with self._lock, self._connection() as connection:
+            if snippet_id is None:
+                cursor = connection.execute(
+                    "INSERT INTO command_snippets(name, command, alias) VALUES (?, ?, ?)",
+                    (normalized_name, normalized_command, normalized_alias),
+                )
+                snippet_id = int(cursor.lastrowid)
+            else:
+                cursor = connection.execute(
+                    "UPDATE command_snippets SET name = ?, command = ?, alias = ? WHERE id = ?",
+                    (normalized_name, normalized_command, normalized_alias, snippet_id),
+                )
+                if cursor.rowcount == 0:
+                    raise LookupError("Командный сниппет не найден")
+        return CommandSnippet(snippet_id, normalized_name, normalized_command, normalized_alias)
+
+    def delete_command_snippet(self, snippet_id: int) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute("DELETE FROM command_snippets WHERE id = ?", (snippet_id,))
+
+    def get_folder_states(self) -> dict[str, bool]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT folder_key, is_expanded FROM folder_states"
+            ).fetchall()
+        return {row["folder_key"]: bool(row["is_expanded"]) for row in rows}
+
+    def save_folder_state(self, folder_key: str, is_expanded: bool) -> None:
+        normalized = folder_key.strip()
+        if not normalized:
+            return
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT INTO folder_states(folder_key, is_expanded) VALUES (?, ?) "
+                "ON CONFLICT(folder_key) DO UPDATE SET is_expanded = excluded.is_expanded",
+                (normalized, is_expanded),
+            )
+
+    def get_setting(self, key: str) -> str | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM app_settings WHERE key = ?", (key,)
+            ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def save_setting(self, key: str, value: str) -> None:
+        normalized = key.strip()
+        if not normalized:
+            raise ValueError("Ключ настройки не может быть пустым")
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (normalized, value),
+            )
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

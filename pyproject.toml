@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "winsshui"
-version = "0.2.0"
+version = "0.4.0"
 description = "SSH connection manager for Windows Terminal"
 requires-python = ">=3.10"
 dependencies = [
@@ -21,3 +21,5 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["winsshui*"]
 
+[tool.setuptools.package-data]
+winsshui = ["assets/*.ico", "assets/device-icons/*.svg", "assets/ui/*.svg"]

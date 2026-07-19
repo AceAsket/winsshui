@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import getpass
+import glob
+import os
 import shlex
 import subprocess
 from collections.abc import Iterable
@@ -13,9 +15,52 @@ class SshConfigReader:
     _pattern_characters = frozenset("*?[]")
 
     def read(self, path: Path) -> list[SshHost]:
-        if not path.exists():
-            return []
-        return self.parse(path.read_text(encoding="utf-8-sig").splitlines(), str(path))
+        hosts: list[SshHost] = []
+        seen: set[str] = set()
+        for config_path in self.discover_config_files(path):
+            for host in self.parse(
+                config_path.read_text(encoding="utf-8-sig").splitlines(),
+                str(config_path),
+            ):
+                key = host.alias.casefold()
+                if key not in seen:
+                    seen.add(key)
+                    hosts.append(host)
+        return hosts
+
+    def discover_config_files(self, path: Path) -> tuple[Path, ...]:
+        root = path.expanduser().resolve()
+        discovered: list[Path] = []
+        visited: set[str] = set()
+
+        def visit(config_path: Path) -> None:
+            resolved = config_path.expanduser().resolve()
+            key = str(resolved).casefold()
+            if key in visited or not resolved.is_file():
+                return
+            visited.add(key)
+            discovered.append(resolved)
+            try:
+                lines = resolved.read_text(encoding="utf-8-sig").splitlines()
+            except OSError:
+                return
+            for raw_line in lines:
+                line = self._remove_comment(raw_line).strip()
+                if not line:
+                    continue
+                keyword, value = self._split_directive(line)
+                if keyword.casefold() != "include":
+                    continue
+                for pattern in self._tokenize(value):
+                    expanded = os.path.expandvars(os.path.expanduser(pattern))
+                    candidate = Path(expanded)
+                    if not candidate.is_absolute():
+                        candidate = resolved.parent / candidate
+                    for match in sorted(glob.glob(str(candidate)), key=str.casefold):
+                        visit(Path(match))
+
+        visit(root)
+        return tuple(discovered)
 
     def parse(self, lines: Iterable[str], source_path: str | None = None) -> list[SshHost]:
         hosts: list[SshHost] = []
@@ -101,14 +146,40 @@ class SshConfigReader:
             "user": "user",
             "identityfile": "identity_file",
             "proxyjump": "proxy_jump",
+            "requesttty": "request_tty",
+            "remotecommand": "remote_command",
         }
-        if key == "port" and "port" not in values:
+        integer_fields = {
+            "port": ("port", 1, 65535),
+            "connecttimeout": ("connect_timeout", 0, 86400),
+            "serveraliveinterval": ("server_alive_interval", 0, 86400),
+            "serveralivecountmax": ("server_alive_count_max", 0, 86400),
+        }
+        boolean_fields = {
+            "forwardagent": "forward_agent",
+            "compression": "compression",
+        }
+        forwarding_fields = {
+            "localforward": "local_forwards",
+            "remoteforward": "remote_forwards",
+            "dynamicforward": "dynamic_forwards",
+        }
+        if key in integer_fields:
+            field, minimum, maximum = integer_fields[key]
+            if field in values:
+                return
             try:
-                port = int(normalized)
+                number = int(normalized)
             except ValueError:
                 return
-            if 1 <= port <= 65535:
-                values["port"] = port
+            if minimum <= number <= maximum:
+                values[field] = number
+        elif key in boolean_fields and boolean_fields[key] not in values:
+            if normalized.casefold() in ("yes", "no"):
+                values[boolean_fields[key]] = normalized.casefold() == "yes"
+        elif key in forwarding_fields:
+            field = forwarding_fields[key]
+            values[field] = (*values.get(field, ()), normalized)
         elif key in field_names:
             values.setdefault(field_names[key], normalized)
 

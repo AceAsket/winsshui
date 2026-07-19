@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -35,6 +37,19 @@ class ImportCandidate:
         normalized = re.sub(r"-+", "-", normalized).strip("-.")
         return normalized or "imported-host"
 
+    @property
+    def origin_identifier(self) -> str:
+        return self.name.replace("\\", "/").strip() or self.alias
+
+    @property
+    def source_fingerprint(self) -> str:
+        return connection_fingerprint(
+            self.hostname,
+            self.user,
+            self.port,
+            self.identity_file,
+        )
+
     def to_draft(self) -> SshConnectionDraft:
         return SshConnectionDraft(
             alias=self.alias,
@@ -50,6 +65,26 @@ class ImportCandidate:
 class ImportScanResult:
     candidates: tuple[ImportCandidate, ...]
     warnings: tuple[str, ...] = ()
+
+
+def connection_fingerprint(
+    hostname: str,
+    user: str | None,
+    port: int | None,
+    identity_file: str | None,
+) -> str:
+    payload = json.dumps(
+        {
+            "hostname": hostname.strip().casefold(),
+            "user": (user or "").strip().casefold(),
+            "port": port or 22,
+            "identity_file": (identity_file or "").strip().casefold(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class WindowsClientImporter:
