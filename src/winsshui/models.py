@@ -67,6 +67,15 @@ class ConnectionMetadata:
     imported_at_utc: str | None = None
     last_synced_at_utc: str | None = None
     icon_name: str | None = None
+    notes: str | None = None
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TunnelPreferences:
+    alias: str
+    auto_restart: bool = False
+    start_with_app: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +122,8 @@ class ConnectionItem:
     imported_at_utc: str | None = None
     last_synced_at_utc: str | None = None
     icon_name: str | None = None
+    notes: str | None = None
+    tags: tuple[str, ...] = ()
 
     @property
     def alias(self) -> str:
@@ -133,4 +144,6 @@ class ConnectionItem:
             self.imported_at_utc,
             self.last_synced_at_utc,
             self.icon_name,
+            self.notes,
+            self.tags,
         )

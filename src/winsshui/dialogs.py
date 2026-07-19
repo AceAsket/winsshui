@@ -6,8 +6,9 @@ import logging
 from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
+from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,12 +34,20 @@ from PySide6.QtWidgets import (
 )
 
 from winsshui.importers import ImportCandidate, WindowsClientImporter
+from winsshui.key_install import PublicKeyInstallCommand, create_public_key_install_command
 from winsshui.diagnostics import SshDiagnostics
 from winsshui.catalog import ConnectionCatalog
-from winsshui.models import CommandSnippet, ConnectionItem, TerminalLaunchMode, WorkspaceItem
+from winsshui.models import (
+    CommandSnippet,
+    ConnectionItem,
+    TerminalLaunchMode,
+    TunnelPreferences,
+    WorkspaceItem,
+)
 from winsshui.ssh_keys import SshKeyInfo, SshKeyManager
 from winsshui.ssh_writer import SshConnectionDraft
 from winsshui.logging_utils import export_diagnostics
+from winsshui.tunnels import tunnel_summary
 
 
 class ApplicationLogDialog(QDialog):
@@ -710,6 +719,302 @@ class SshKeyManagerDialog(QDialog):
             self._reload()
         except (OSError, RuntimeError) as exception:
             QMessageBox.warning(self, "Не удалось удалить ключ из агента", str(exception))
+
+
+class InstallPublicKeyDialog(QDialog):
+    def __init__(
+        self,
+        manager: SshKeyManager,
+        ssh_path: str,
+        alias: str,
+        askpass_path: str | None = None,
+        credential_alias: str | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.manager = manager
+        self.ssh_path = ssh_path
+        self.alias = alias
+        self.askpass_path = askpass_path
+        self.credential_alias = credential_alias
+        self._process: QProcess | None = None
+        self._public_key = ""
+        self._private_path: str | None = None
+        self._stage = ""
+        self.setWindowTitle(f"Установка ключа — {alias}")
+        self.resize(650, 390)
+
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Публичный ключ будет добавлен в ~/.ssh/authorized_keys через защищённое "
+            "SSH-подключение. Приложение не передаёт ключ в аргументах процесса и не "
+            "изменяет проверку ключа сервера."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        form = QFormLayout()
+        self.key_combo = QComboBox()
+        form.addRow("Публичный ключ:", self.key_combo)
+        form.addRow("Сервер:", QLabel(alias))
+        layout.addLayout(form)
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setPlaceholderText("Здесь появится результат установки и проверки.")
+        layout.addWidget(self.output, 1)
+        actions = QHBoxLayout()
+        self.install_button = QPushButton("Установить и проверить")
+        self.install_button.setObjectName("accentButton")
+        self.install_button.clicked.connect(self._start)
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(self.reject)
+        actions.addStretch()
+        actions.addWidget(self.install_button)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        self._load_keys()
+
+    def _load_keys(self) -> None:
+        self.key_combo.clear()
+        try:
+            keys = [key for key in self.manager.list_keys() if key.public_path]
+        except (OSError, subprocess.SubprocessError) as exception:
+            self.output.setPlainText(f"Не удалось прочитать ключи: {exception}")
+            keys = []
+        for key in keys:
+            self.key_combo.addItem(f"{key.name} · {key.key_type} · {key.fingerprint}", key)
+        self.install_button.setEnabled(bool(keys))
+        if not keys:
+            self.output.setPlainText(
+                "Публичные ключи (*.pub) не найдены в ~/.ssh. Сначала создайте ключ "
+                "в разделе «SSH-ключи»."
+            )
+
+    def _start(self) -> None:
+        key = self.key_combo.currentData()
+        if not isinstance(key, SshKeyInfo) or not key.public_path:
+            return
+        try:
+            self._public_key = key.public_path.read_text(encoding="utf-8").strip()
+            self._private_path = str(key.private_path) if key.private_path else None
+            command = create_public_key_install_command(
+                self.ssh_path, self.alias, self._public_key
+            )
+        except (OSError, ValueError) as exception:
+            QMessageBox.warning(self, "Не удалось подготовить ключ", str(exception))
+            return
+        self.output.setPlainText("Подключаюсь и устанавливаю публичный ключ…")
+        self.install_button.setEnabled(False)
+        self._run(command, "install")
+
+    def _run(self, command: PublicKeyInstallCommand, stage: str) -> None:
+        process = QProcess(self)
+        self._process = process
+        self._stage = stage
+        process.setProgram(command.program)
+        process.setArguments(list(command.arguments))
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        if stage == "install" and self.askpass_path and self.credential_alias:
+            environment = QProcessEnvironment.systemEnvironment()
+            environment.insert("SSH_ASKPASS", self.askpass_path)
+            environment.insert("SSH_ASKPASS_REQUIRE", "force")
+            environment.insert("WINSSHUI_CREDENTIAL_ALIAS", self.credential_alias)
+            process.setProcessEnvironment(environment)
+        process.started.connect(
+            lambda: (process.write(command.standard_input), process.closeWriteChannel())
+        )
+        process.finished.connect(
+            lambda exit_code, _status: self._finished(process, exit_code)
+        )
+        process.errorOccurred.connect(lambda _error: self._process_error(process))
+        process.start()
+
+    def _finished(self, process: QProcess, exit_code: int) -> None:
+        if process is not self._process:
+            process.deleteLater()
+            return
+        output = bytes(process.readAll()).decode("utf-8", errors="replace").strip()
+        stage = self._stage
+        process.deleteLater()
+        self._process = None
+        if exit_code != 0:
+            self.output.appendPlainText(
+                "\nОшибка: " + (output or f"ssh завершился с кодом {exit_code}")
+            )
+            self.install_button.setEnabled(True)
+            return
+        if stage == "install":
+            self.output.appendPlainText("\nКлюч записан. Проверяю результат без пароля…")
+            try:
+                command = create_public_key_install_command(
+                    self.ssh_path,
+                    self.alias,
+                    self._public_key,
+                    verify=True,
+                    identity_file=self._private_path,
+                )
+            except ValueError as exception:
+                self.output.appendPlainText(f"\nОшибка проверки: {exception}")
+                self.install_button.setEnabled(True)
+                return
+            self._run(command, "verify")
+            return
+        if self._private_path:
+            message = "Готово: установленный ключ найден и проверен подключением без пароля."
+        else:
+            message = "Готово: строка ключа найдена в authorized_keys. Приватная часть недоступна для отдельной проверки."
+        self.output.appendPlainText(f"\n{message}")
+        self.install_button.setEnabled(True)
+
+    def _process_error(self, process: QProcess) -> None:
+        if process is not self._process or process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self.output.appendPlainText(f"\nНе удалось запустить ssh.exe: {process.errorString()}")
+        self._process = None
+        process.deleteLater()
+        self.install_button.setEnabled(True)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        process = self._process
+        self._process = None
+        if process and process.state() != QProcess.ProcessState.NotRunning:
+            process.kill()
+            process.waitForFinished(500)
+        super().closeEvent(event)
+
+
+class TunnelManagerDialog(QDialog):
+    def __init__(
+        self,
+        catalog: ConnectionCatalog,
+        connections: list[ConnectionItem],
+        is_active: Callable[[str], bool],
+        toggle: Callable[[str], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.catalog = catalog
+        self.connections = [
+            connection
+            for connection in connections
+            if connection.host.local_forwards
+            or connection.host.remote_forwards
+            or connection.host.dynamic_forwards
+        ]
+        self.is_active = is_active
+        self.toggle = toggle
+        self._loading = False
+        self.setWindowTitle("Менеджер SSH-туннелей")
+        self.resize(900, 510)
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Фоновые туннели используют ключ или ssh-agent. Автозапуск и автоматический "
+            "перезапуск выключены, пока вы не включите их для конкретного подключения."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Подключение", "Пробросы", "Состояние", "Автоперезапуск", "При запуске"]
+        )
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, self.table.horizontalHeader().ResizeMode.Stretch
+        )
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.itemChanged.connect(self._preference_changed)
+        layout.addWidget(self.table, 1)
+        actions = QHBoxLayout()
+        self.toggle_button = QPushButton("Запустить")
+        self.toggle_button.setObjectName("accentButton")
+        self.toggle_button.clicked.connect(self._toggle_selected)
+        refresh_button = QPushButton("Обновить")
+        refresh_button.clicked.connect(self.refresh)
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(refresh_button)
+        actions.addStretch()
+        actions.addWidget(self.toggle_button)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        self._populate()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start(1000)
+
+    def _populate(self) -> None:
+        preferences = self.catalog.get_tunnel_preferences()
+        self._loading = True
+        self.table.setRowCount(len(self.connections))
+        for row, connection in enumerate(self.connections):
+            alias = QTableWidgetItem(connection.alias)
+            alias.setData(Qt.ItemDataRole.UserRole, connection.alias)
+            self.table.setItem(row, 0, alias)
+            summary = QTableWidgetItem(tunnel_summary(connection.host))
+            summary.setToolTip(summary.text())
+            self.table.setItem(row, 1, summary)
+            self.table.setItem(row, 2, QTableWidgetItem())
+            saved = preferences.get(connection.alias.casefold(), TunnelPreferences(connection.alias))
+            self.table.setItem(row, 3, self._check_item(saved.auto_restart))
+            self.table.setItem(row, 4, self._check_item(saved.start_with_app))
+        self._loading = False
+        if self.connections:
+            self.table.selectRow(0)
+        self.refresh()
+
+    @staticmethod
+    def _check_item(checked: bool) -> QTableWidgetItem:
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        return item
+
+    def _selected_alias(self) -> str | None:
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        value = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return value if isinstance(value, str) else None
+
+    def _preference_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading or item.column() not in (3, 4):
+            return
+        row = item.row()
+        alias_item = self.table.item(row, 0)
+        if not alias_item:
+            return
+        self.catalog.save_tunnel_preferences(
+            TunnelPreferences(
+                str(alias_item.data(Qt.ItemDataRole.UserRole)),
+                self.table.item(row, 3).checkState() == Qt.CheckState.Checked,
+                self.table.item(row, 4).checkState() == Qt.CheckState.Checked,
+            )
+        )
+
+    def _toggle_selected(self) -> None:
+        alias = self._selected_alias()
+        if alias:
+            self.toggle(alias)
+            QTimer.singleShot(250, self.refresh)
+
+    def _selection_changed(self) -> None:
+        alias = self._selected_alias()
+        self.toggle_button.setEnabled(alias is not None)
+        self.toggle_button.setText(
+            "Остановить" if alias and self.is_active(alias) else "Запустить"
+        )
+
+    def refresh(self) -> None:
+        for row in range(self.table.rowCount()):
+            alias_item = self.table.item(row, 0)
+            alias = str(alias_item.data(Qt.ItemDataRole.UserRole))
+            active = self.is_active(alias)
+            status = self.table.item(row, 2)
+            status.setText("Работает" if active else "Остановлен")
+            status.setForeground(Qt.GlobalColor.darkGreen if active else Qt.GlobalColor.gray)
+        self._selection_changed()
 
 
 class WorkspaceDialog(QDialog):
