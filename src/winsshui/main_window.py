@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QSystemTrayIcon,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -58,6 +59,7 @@ from winsshui.dialogs import (
 )
 from winsshui.credentials import WindowsCredentialStore
 from winsshui.diagnostics import SshDiagnostics
+from winsshui.embedded_terminal import EmbeddedWindowsTerminalHost
 from winsshui.device_icons import (
     DEVICE_ICON_OPTIONS,
     device_icon,
@@ -72,7 +74,9 @@ from winsshui.models import (
     ConnectionItem,
     ConnectionMetadata,
     EffectiveSshConfiguration,
+    SshHost,
     TerminalLaunchMode,
+    WorkspaceItem,
 )
 from winsshui.resources import resource_path
 from winsshui.ssh_config import SshConfigReader, SshConfigurationResolver
@@ -86,6 +90,7 @@ from winsshui.terminal import (
     detect_tools,
 )
 from winsshui.productivity_dialogs import BulkActionsDialog, QuickLaunchDialog
+from winsshui.process_inspection import exclude_running_sessions, running_ssh_alias_counts
 from winsshui.transfer_dialog import SftpBrowserDialog
 from winsshui.transfers import OpenSshTransferManager
 from winsshui.tunnels import configured_local_endpoints, find_port_conflicts
@@ -142,6 +147,7 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._force_quit = False
         self._tray_hint_shown = False
+        self._embedded_terminal_enabled = True
         self._previous_session: tuple[tuple[str, TerminalLaunchMode], ...] = ()
         self.tray_icon: QSystemTrayIcon | None = None
         try:
@@ -164,6 +170,7 @@ class MainWindow(QMainWindow):
 
         try:
             self.catalog.initialize()
+            self._load_terminal_embedding_setting()
             self._previous_session = self.catalog.begin_session()
             self.reload_connections()
             self._setup_tray()
@@ -230,13 +237,20 @@ class MainWindow(QMainWindow):
         header.addWidget(self.refresh_button)
         root.addLayout(header)
 
+        self.content_tabs = QTabWidget()
+        self.content_tabs.setObjectName("contentTabs")
+        connections_page = QWidget()
+        connections_layout = QVBoxLayout(connections_page)
+        connections_layout.setContentsMargins(0, 0, 0, 0)
+        connections_layout.setSpacing(12)
+
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("searchInput")
         self.search_edit.setPlaceholderText("Поиск по имени, адресу, пользователю или папке…")
         self.search_edit.setMinimumHeight(42)
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(lambda _text: self._rebuild_connection_list())
-        root.addWidget(self.search_edit)
+        connections_layout.addWidget(self.search_edit)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("mainSplitter")
@@ -245,12 +259,26 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_details_panel())
         splitter.setSizes([390, 690])
-        root.addWidget(splitter, 1)
+        connections_layout.addWidget(splitter, 1)
+        self.connections_tab_index = self.content_tabs.addTab(
+            connections_page, "Подключения"
+        )
+        self.embedded_terminal = EmbeddedWindowsTerminalHost(
+            self.terminal_launcher, self
+        )
+        self.terminal_tab_index = self.content_tabs.addTab(
+            self.embedded_terminal, "Терминал"
+        )
+        root.addWidget(self.content_tabs, 1)
 
         footer = QHBoxLayout()
         self.status_label = QLabel("Готово")
         self.status_label.setObjectName("secondary")
         self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.embedded_terminal.status_changed.connect(self.status_label.setText)
+        self.embedded_terminal.embedding_changed.connect(
+            self._terminal_embedding_changed
+        )
         self.tool_status_label = QLabel(self.tools.message)
         self.tool_status_label.setObjectName("statusBadge")
         self.version_label = QLabel(f"WinSSH UI {__version__}")
@@ -587,6 +615,20 @@ class MainWindow(QMainWindow):
                 background: #1d2025;
                 border: 1px solid #343942;
                 border-radius: 10px;
+            }
+            QFrame#embeddedTerminalCard {
+                background: #16181c;
+                border: 1px solid #343942;
+                border-radius: 9px;
+            }
+            QFrame#terminalPlaceholder {
+                background: #1d2025;
+                border: 1px dashed #414750;
+                border-radius: 8px;
+            }
+            QWidget#terminalSurface {
+                background: #0c0c0c;
+                border: none;
             }
             QLineEdit, QPlainTextEdit, QSpinBox, QComboBox {
                 color: #eef1f5;
@@ -1504,6 +1546,7 @@ class MainWindow(QMainWindow):
                     tunnel.kill()
                     tunnel.waitForFinished(300)
         self._tunnel_processes.clear()
+        self.embedded_terminal.close_terminal()
         super().closeEvent(event)
 
     def _show_effective_configuration(self, configuration: EffectiveSshConfiguration) -> None:
@@ -1682,7 +1725,7 @@ class MainWindow(QMainWindow):
     def _open_bulk_workspace(self, connections: list[ConnectionItem]) -> None:
         items = [(connection.host, TerminalLaunchMode.NEW_TAB) for connection in connections]
         try:
-            self.terminal_launcher.launch_workspace(items)
+            self._open_workspace_process(items)
             for connection in connections:
                 self.catalog.record_launch(connection.alias, TerminalLaunchMode.NEW_TAB)
             self._reload_history()
@@ -1828,6 +1871,66 @@ class MainWindow(QMainWindow):
         except sqlite3.Error as exception:
             self._show_error("Не удалось сохранить настройку трея", exception)
 
+    def _load_terminal_embedding_setting(self) -> None:
+        self._embedded_terminal_enabled = (
+            self.catalog.get_setting("ui.embed_windows_terminal") != "0"
+        )
+        self.content_tabs.setTabVisible(
+            self.terminal_tab_index, self._embedded_terminal_enabled
+        )
+
+    def _set_terminal_embedding(self, enabled: bool) -> None:
+        try:
+            self.catalog.save_setting(
+                "ui.embed_windows_terminal", "1" if enabled else "0"
+            )
+        except sqlite3.Error as exception:
+            self._show_error("Не удалось сохранить режим терминала", exception)
+            return
+        self._embedded_terminal_enabled = enabled
+        if not enabled:
+            self.content_tabs.setCurrentIndex(self.connections_tab_index)
+            self.embedded_terminal.detach_to_desktop()
+        self.content_tabs.setTabVisible(self.terminal_tab_index, enabled)
+
+    def _can_embed_terminal(self) -> bool:
+        return self._embedded_terminal_enabled and self.embedded_terminal.available
+
+    def _terminal_embedding_changed(self, embedded: bool) -> None:
+        if not embedded and self.content_tabs.currentIndex() == self.terminal_tab_index:
+            self.content_tabs.setCurrentIndex(self.connections_tab_index)
+
+    def _open_terminal_process(
+        self,
+        connection: ConnectionItem,
+        mode: TerminalLaunchMode,
+        credential_alias: str | None,
+    ) -> bool:
+        if self._can_embed_terminal():
+            placement = self.embedded_terminal.launch_connection(
+                connection.host, mode, credential_alias
+            )
+            if placement is not None:
+                if placement:
+                    self.content_tabs.setCurrentIndex(self.terminal_tab_index)
+                return placement
+        self.terminal_launcher.launch(connection.host, mode, credential_alias)
+        return False
+
+    def _open_workspace_process(
+        self,
+        items: list[tuple[SshHost, WorkspaceItem | TerminalLaunchMode]],
+        window_name: str = "winsshui",
+    ) -> bool:
+        if self._can_embed_terminal():
+            placement = self.embedded_terminal.launch_workspace(items)
+            if placement is not None:
+                if placement:
+                    self.content_tabs.setCurrentIndex(self.terminal_tab_index)
+                return placement
+        self.terminal_launcher.launch_workspace(items, window_name)
+        return False
+
     def _quit_from_tray(self) -> None:
         self._force_quit = True
         QApplication.setQuitOnLastWindowClosed(True)
@@ -1839,10 +1942,14 @@ class MainWindow(QMainWindow):
     ) -> list[tuple[ConnectionItem, TerminalLaunchMode]]:
         if not self.tools.can_connect:
             return []
+        pending = exclude_running_sessions(
+            self._previous_session,
+            running_ssh_alias_counts(alias for alias, _mode in self._previous_session),
+        )
         by_alias = {connection.alias.casefold(): connection for connection in self.connections}
         return [
             (connection, mode)
-            for alias, mode in self._previous_session
+            for alias, mode in pending
             if (connection := by_alias.get(alias.casefold())) is not None
         ]
 
@@ -1893,10 +2000,8 @@ class MainWindow(QMainWindow):
         for index, (connection, saved_mode) in enumerate(entries):
             mode = TerminalLaunchMode.NEW_TAB if index == 0 else saved_mode
             try:
-                self.terminal_launcher.launch(
-                    connection.host,
-                    mode,
-                    self._credential_alias_for(connection),
+                self._open_terminal_process(
+                    connection, mode, self._credential_alias_for(connection)
                 )
                 self.catalog.record_launch(connection.alias, mode)
                 restored.append(connection.alias)
@@ -1941,6 +2046,14 @@ class MainWindow(QMainWindow):
         close_to_tray.setChecked(self.catalog.get_setting("ui.close_to_tray") == "1")
         close_to_tray.setEnabled(self.tray_icon is not None)
         close_to_tray.toggled.connect(self._set_close_to_tray)
+        embedded_terminal = menu.addAction("Встраивать Windows Terminal в приложение")
+        embedded_terminal.setCheckable(True)
+        embedded_terminal.setChecked(self._embedded_terminal_enabled)
+        embedded_terminal.setEnabled(self.embedded_terminal.available)
+        embedded_terminal.setToolTip(
+            "Экспериментальный режим: настоящее окно Windows Terminal размещается внутри WinSSH UI"
+        )
+        embedded_terminal.toggled.connect(self._set_terminal_embedding)
         winscp_new_instance = menu.addAction("WinSCP: всегда открывать новое окно")
         winscp_new_instance.setCheckable(True)
         winscp_new_instance.setChecked(self.catalog.get_setting("winscp.new_instance") == "1")
@@ -2318,12 +2431,23 @@ class MainWindow(QMainWindow):
         if not connection:
             return
         try:
-            self.terminal_launcher.launch_snippet(
-                connection.host,
-                snippet.command,
-                f"{connection.alias} · {snippet.name}",
-                self._credential_alias_for(connection),
-            )
+            placement: bool | None = None
+            if self._can_embed_terminal():
+                placement = self.embedded_terminal.launch_snippet(
+                    connection.host,
+                    snippet.command,
+                    f"{connection.alias} · {snippet.name}",
+                    self._credential_alias_for(connection),
+                )
+                if placement:
+                    self.content_tabs.setCurrentIndex(self.terminal_tab_index)
+            if placement is None:
+                self.terminal_launcher.launch_snippet(
+                    connection.host,
+                    snippet.command,
+                    f"{connection.alias} · {snippet.name}",
+                    self._credential_alias_for(connection),
+                )
             self.status_label.setText(
                 f"Запускаю «{snippet.name}» на {connection.alias} в Windows Terminal…"
             )
@@ -2438,7 +2562,7 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            self.terminal_launcher.launch_workspace(items, dialog.launch_window_name)
+            self._open_workspace_process(items, dialog.launch_window_name)
             for host, item in items:
                 self.catalog.record_launch(host.alias, item.mode)
             self._reload_history()
@@ -2785,10 +2909,14 @@ class MainWindow(QMainWindow):
     ) -> None:
         try:
             credential_alias = self._credential_alias_for(connection)
-            self.terminal_launcher.launch(connection.host, mode, credential_alias)
+            embedded = self._open_terminal_process(connection, mode, credential_alias)
             self.catalog.record_launch(connection.alias, mode)
             self._reload_history()
-            self.status_label.setText(f"Открываю {connection.alias} в Windows Terminal…")
+            self.status_label.setText(
+                f"Открываю {connection.alias} во встроенном Windows Terminal…"
+                if embedded
+                else f"Открываю {connection.alias} в Windows Terminal…"
+            )
             self.logger.info(
                 "Opened SSH connection %s in mode %s; authentication=%s",
                 connection.alias,

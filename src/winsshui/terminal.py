@@ -63,9 +63,12 @@ class WindowsTerminalLauncher:
         host: SshHost,
         mode: TerminalLaunchMode,
         credential_alias: str | None = None,
+        window_name: str = "winsshui",
     ) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
-            self._credential_command(self.create_command(host, mode), credential_alias),
+            self._credential_command(
+                self.create_command(host, mode, window_name), credential_alias
+            ),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             close_fds=True,
             env=self._credential_environment(credential_alias),
@@ -101,10 +104,14 @@ class WindowsTerminalLauncher:
         remote_command: str,
         title: str | None = None,
         credential_alias: str | None = None,
+        window_name: str = "winsshui",
     ) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
             self._credential_command(
-                self.create_snippet_command(host, remote_command, title), credential_alias
+                self.create_snippet_command(
+                    host, remote_command, title, window_name
+                ),
+                credential_alias,
             ),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             close_fds=True,

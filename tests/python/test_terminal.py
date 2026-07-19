@@ -59,6 +59,19 @@ class WindowsTerminalLauncherTests(unittest.TestCase):
         self.assertEqual("prod", environment["WINSSHUI_CREDENTIAL_ALIAS"])
         self.assertNotIn("test-secret", " ".join(arguments))
 
+    def test_launch_can_target_embedded_named_window(self) -> None:
+        launcher = WindowsTerminalLauncher()
+        with patch("winsshui.terminal.subprocess.Popen") as popen:
+            launcher.launch(
+                SshHost("router"),
+                TerminalLaunchMode.NEW_TAB,
+                window_name="winsshui-embedded-test",
+            )
+        self.assertEqual(
+            ["wt.exe", "-w", "winsshui-embedded-test"],
+            popen.call_args.args[0][:3],
+        )
+
     def test_workspace_applies_split_size_title_color_and_window(self) -> None:
         command = WindowsTerminalLauncher().create_workspace_command(
             [
