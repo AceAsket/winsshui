@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from winsshui.ssh_config import SshConfigReader, SshConfigurationResolver
 
@@ -29,6 +31,28 @@ class SshConfigReaderTests(unittest.TestCase):
         self.assertEqual(1, len(hosts))
         self.assertEqual("admin", hosts[0].user)
 
+    def test_reads_include_globs_recursively_and_tracks_source_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="winsshui-config-") as directory:
+            root = Path(directory) / ".ssh"
+            included = root / "config.d"
+            included.mkdir(parents=True)
+            config = root / "config"
+            config.write_text(
+                "Include config.d/*.conf\nHost root-host\n    HostName root.test\n",
+                encoding="utf-8",
+            )
+            child = included / "production.conf"
+            child.write_text(
+                "Include ../config\nHost included-host\n    HostName included.test\n",
+                encoding="utf-8",
+            )
+            reader = SshConfigReader()
+            hosts = reader.read(config)
+            self.assertEqual({"root-host", "included-host"}, {host.alias for host in hosts})
+            included_host = next(host for host in hosts if host.alias == "included-host")
+            self.assertEqual(str(child.resolve()), included_host.source_path)
+            self.assertEqual((config.resolve(), child.resolve()), reader.discover_config_files(config))
+
 
 class SshConfigurationResolverTests(unittest.TestCase):
     def test_parses_effective_configuration(self) -> None:
@@ -49,4 +73,3 @@ class SshConfigurationResolverTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

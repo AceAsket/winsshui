@@ -3,12 +3,18 @@ from pathlib import Path
 
 project_root = Path(SPEC).resolve().parent
 icon_path = project_root / "src" / "winsshui" / "assets" / "AppIcon.ico"
+device_icons_path = project_root / "src" / "winsshui" / "assets" / "device-icons"
+ui_assets_path = project_root / "src" / "winsshui" / "assets" / "ui"
 
 a = Analysis(
     [str(project_root / "src" / "winsshui" / "__main__.py")],
     pathex=[str(project_root / "src")],
     binaries=[],
-    datas=[(str(icon_path), "assets")],
+    datas=[
+        (str(icon_path), "assets"),
+        (str(device_icons_path), "assets/device-icons"),
+        (str(ui_assets_path), "assets/ui"),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

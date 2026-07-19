@@ -18,6 +18,16 @@ class SshHost:
     port: int | None = None
     identity_file: str | None = None
     proxy_jump: str | None = None
+    connect_timeout: int | None = None
+    server_alive_interval: int | None = None
+    server_alive_count_max: int | None = None
+    forward_agent: bool | None = None
+    compression: bool | None = None
+    request_tty: str | None = None
+    remote_command: str | None = None
+    local_forwards: tuple[str, ...] = ()
+    remote_forwards: tuple[str, ...] = ()
+    dynamic_forwards: tuple[str, ...] = ()
     source_path: str | None = None
 
     @property
@@ -51,6 +61,12 @@ class ConnectionMetadata:
     alias: str
     is_favorite: bool = False
     group_name: str | None = None
+    origin_type: str | None = None
+    origin_identifier: str | None = None
+    source_fingerprint: str | None = None
+    imported_at_utc: str | None = None
+    last_synced_at_utc: str | None = None
+    icon_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,11 +81,38 @@ class HistoryEntry:
         return self.launched_at_utc.astimezone().strftime("%d.%m.%Y %H:%M")
 
 
+@dataclass(frozen=True, slots=True)
+class WorkspaceItem:
+    alias: str
+    mode: TerminalLaunchMode
+
+
+@dataclass(frozen=True, slots=True)
+class Workspace:
+    id: int
+    name: str
+    items: tuple[WorkspaceItem, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CommandSnippet:
+    id: int
+    name: str
+    command: str
+    alias: str | None = None
+
+
 @dataclass(slots=True)
 class ConnectionItem:
     host: SshHost
     is_favorite: bool = False
     group_name: str | None = None
+    origin_type: str | None = None
+    origin_identifier: str | None = None
+    source_fingerprint: str | None = None
+    imported_at_utc: str | None = None
+    last_synced_at_utc: str | None = None
+    icon_name: str | None = None
 
     @property
     def alias(self) -> str:
@@ -80,5 +123,14 @@ class ConnectionItem:
         return self.group_name or "Без группы"
 
     def metadata(self) -> ConnectionMetadata:
-        return ConnectionMetadata(self.alias, self.is_favorite, self.group_name)
-
+        return ConnectionMetadata(
+            self.alias,
+            self.is_favorite,
+            self.group_name,
+            self.origin_type,
+            self.origin_identifier,
+            self.source_fingerprint,
+            self.imported_at_utc,
+            self.last_synced_at_utc,
+            self.icon_name,
+        )
