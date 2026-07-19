@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winsshui"
+version = "0.2.0"
+description = "SSH connection manager for Windows Terminal"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6==6.11.1",
+]
+
+[project.gui-scripts]
+winsshui = "winsshui.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["winsshui*"]
+
